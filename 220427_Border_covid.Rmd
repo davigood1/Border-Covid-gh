@@ -1,0 +1,2833 @@
+## Setup
+```{r Library, include=FALSE}
+library(devtools)
+#devtools::install_github("UrbanInstitute/urbnmapr")
+#devtools::install_github("diegovalle/mxmaps") 
+#devtools::install_github("yutannihilation/ggsflabel")
+#devtools::install_github("ropensci/rcrossref")
+#remotes::install_github("davidgohel/officedown")
+
+library(pacman)
+pacman::p_load(tidyverse, zoo, ggnewscale, ggpubr, ggrepel, sf, tidycensus, colorspace, 
+               kableExtra, OData, epitools, ggpmisc, flextable, officer, lubridate, 
+               reshape2, viridis)
+pacman::p_load_gh("mxmaps", "urbnmapr", "ggsflabel", "rcrossref", "citr", "officedown")
+
+#Create functions to load p values on ggplots
+fit.tidy <-  stat_fit_tidy(method = "lm",
+                label.x = "right",
+                method.args = list(formula = y ~ x),
+                mapping = aes(label = sprintf("Slope = %.3g\np-value = %s\n",
+                                              stat(x_estimate),
+                                              stat(format.pval(x_p.value, eps = .001, digits = 2)))))
+
+fit.tidy2 <-  stat_fit_tidy(method = "lm",
+                label.x = "left",
+                method.args = list(formula = y ~ x),
+                mapping = aes(label = sprintf("Slope = %.3g\np-value = %s\n",
+                                              stat(x_estimate),
+                                              stat(format.pval(x_p.value, eps = .001, digits = 2)))))
+
+```
+
+## Data Import and Analysis
+```{r Import US Case and Death Data, include=FALSE}
+#Import NY times database
+#df.us <- read.csv("https://raw.githubusercontent.com/nytimes/covid-19-data/master/us-counties.csv")
+#df.us$date <- as.Date(df.us$date)
+
+#Import John Hopkins 
+##Case data first
+df.hopkins.case <- read.csv("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_confirmed_US.csv")
+df.hopkins.case <- df.hopkins.case %>% dplyr::select(fips = FIPS, county = Admin2, state = Province_State,
+                                                     12:ncol(df.hopkins.case))
+df.hopkins.case <- df.hopkins.case %>% gather(key = date, value = cases, 4:ncol(df.hopkins.case))
+df.hopkins.case$date <- str_sub(df.hopkins.case$date, 2)
+df.hopkins.case$date <- as.Date(df.hopkins.case$date, "%m.%d.%y")
+
+##Death data
+df.hopkins.death <- read.csv("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_deaths_US.csv")
+df.hopkins.death <- df.hopkins.death %>% dplyr::select(fips = FIPS, county = Admin2, state = Province_State,
+                                                     13:ncol(df.hopkins.death))
+df.hopkins.death <- df.hopkins.death %>% gather(key = date, value = deaths, 4:ncol(df.hopkins.death))
+df.hopkins.death$date <- str_sub(df.hopkins.death$date, 2)
+df.hopkins.death$date <- as.Date(df.hopkins.death$date, "%m.%d.%y")
+
+#Merge case and death data into one df
+df.hopkins <- df.hopkins.case %>% 
+  left_join(df.hopkins.death %>% dplyr::select(fips, date, deaths), by = c("fips", "date"))
+df.hopkins$county <- as.character(df.hopkins$county)
+df.hopkins <- df.hopkins %>% filter(!county == "")
+df.us <- df.hopkins
+
+
+#Import ACS - population
+acs.variables <-load_variables(2019, "acs5", cache = TRUE)
+census_api_key("5176ddf220178d9d7ff9862ada7c00166eb146c7", overwrite = TRUE, install=TRUE)
+readRenviron("~/.Renviron")
+df.census <- get_acs(geography = "county",
+              variables = c(population = "B01003_001"),
+              #state = c("CA", "AZ", "NM", "TX"),
+              year = 2019)
+df.census$fips <- as.numeric(df.census$GEOID) #Take away leading zero to match NYT
+
+#Subset border states
+df.us <- df.us %>% 
+  mutate(south = case_when(state %in% c("California", "Arizona", "New Mexico", "Texas") ~ "Yes",
+                           TRUE ~ "No"))
+
+#Create population variable
+df.us <- df.us %>% left_join(df.census, by = "fips") %>% 
+  dplyr::select(date, county, state, fips, cases, deaths, population = estimate, south)
+
+#Create stay at home order
+df.us <- df.us %>% mutate(stay.home = case_when(fips == "6073" ~ "3/19/2020", #SD
+                                     fips == "6025" ~ "3/19/2020", #Imperial
+                                     fips == "4027" ~ "3/31/2020", #Yuma
+                                     fips == "48141" ~ "4/2/2020", #El paso
+                                     fips == "48061" ~ "4/2/2020", #Cameron/Brownsville
+                                     fips == "48479" ~ "4/2/2020" #Webb/Laredo
+                                     ))
+df.us$stay.home <- as.Date(df.us$stay.home, "%m/%d/%y")
+
+#Create reopening
+#https://www.latimes.com/projects/california-coronavirus-cases-tracking-outbreak/reopening-across-counties/
+#https://www.nytimes.com/interactive/2020/us/states-reopen-map-coronavirus.html
+df.us <- df.us %>% mutate(reopen = case_when(fips == "6073" ~ "5/8/2020", #SD
+                                     fips == "6025" ~ "5/8/2020", #Imperial
+                                     fips == "4027" ~ "5/15/2020", #Yuma
+                                     fips == "48141" ~ "4/30/2020", #El paso
+                                     fips == "48061" ~ "4/30/2020", #Cameron/Brownsville
+                                     fips == "48479" ~ "4/30/2020" #Webb/Laredo
+                                     ))
+df.us$reopen <- as.Date(df.us$reopen, "%m/%d/%y")
+#
+
+#Create second stay home
+#https://www.latimes.com/projects/california-coronavirus-cases-tracking-outbreak/reopening-across-counties/
+#https://www.nytimes.com/interactive/2020/us/states-reopen-map-coronavirus.html
+df.us <- df.us %>% mutate(stay.home2 = case_when(fips == "6073" ~ "6/13/2020", #SD
+                                     fips == "6025" ~ "6/13/2020", #Imperial
+                                     fips == "4027" ~ "6/29/2020", #Yuma
+                                     fips == "48141" ~ "6/26/2020", #El paso
+                                     fips == "48061" ~ "6/26/2020", #Cameron/Brownsville
+                                     fips == "48479" ~ "6/26/2020" #Webb/Laredo
+                                     ))
+df.us$stay.home2 <- as.Date(df.us$stay.home2, "%m/%d/%y")
+
+#border closure date
+df.us$border.closure <- as.Date("3/21/2020", "%m/%d/%y") 
+
+#Order counties for wrap
+df.us <- df.us %>% mutate(county2 = case_when(fips == "6073" ~ "San Diego, CA",
+                                        fips == "6025" ~ "Imperial County, CA",
+                                        fips == "4027" ~ "Yuma, AZ",
+                                        fips == "48141" ~ "El Paso, TX", 
+                                        fips == "48061" ~ "Cameron/Brownsville, TX",
+                                        fips == "48479" ~ "Webb/Laredo, TX"))
+df.us$country <- "USA"
+
+#Daily numbers
+df.us <- df.us %>% group_by(fips) %>% arrange(date) %>% mutate(cases.daily = cases -  lag(cases))
+df.us <- df.us %>% group_by(fips) %>% arrange(date) %>% mutate(deaths.daily = deaths -  lag(deaths))
+
+#%>%
+ # mutate(deaths.daily = case_when(deaths.daily < 0 ~ 0,
+  #                                TRUE ~ deaths.daily))
+border.us.fips <- c("6073", "6025", 
+                    "4027", "4019", "4003", "4023", 
+                    "35023", "35013", "35029", "35017", 
+                    "48141", "48229", "48377", "48043", "48443", "48465", 
+                    "48271", "48505", "48427", "48215", "48323", "48243",
+                    "48061", "48479", "48109")
+
+df.us <- df.us %>% mutate(border = ifelse(fips %in% border.us.fips, "Yes", "No"))
+df.us <- df.us %>% filter(!is.na(fips))
+```
+```{r Import Mexico Case and Death Data, include=FALSE}
+#Import mexican df - Adrian 
+#df.mx <- readxl::read_excel("Frontera2.xlsx")
+#df.mx$date <- as.Date(df.mx$date)
+#df.mx$stay.home <- as.Date(df.mx$stay.home)
+#df.mx$reopen <- as.Date(df.mx$reopen)
+#df.mx$stay.home2 <- as.Date(df.mx$stay.home2)
+
+#Import from Datos Abiertos - https://coronavirus.gob.mx/datos/#DownZCSV
+#Import suspected cases and go from wide to long
+mx.sosp <- read.csv("Data/Casos_Diarios_Municipio_Sospechosos_20211201.csv")
+mx.sosp  <- gather(mx.sosp , date, sospechosos, X29.01.2020:ncol(mx.sosp), factor_key=F)
+mx.sosp$date <- sub('.', '', mx.sosp$date)
+mx.sosp$date <- as.Date(mx.sosp$date, format = "%d.%m.%Y")
+
+#Do the same with confirmed cases
+mx.conf <- read.csv("Data/Casos_Diarios_Municipio_Confirmados_20211201.csv")
+#mx.conf <- gather(mx.conf, date, confirmados, X12.01.2020:ncol(mx.conf), factor_key=F)
+mx.conf <- gather(mx.conf, date, confirmados, X26.02.2020:ncol(mx.conf), factor_key=F)
+mx.conf$date <- sub('.', '', mx.conf$date)
+mx.conf$date <- as.Date(mx.conf$date, format = "%d.%m.%Y")
+
+#Do the same with deaths
+mx.death <- read.csv("Data/Casos_Diarios_Municipio_Defunciones_20211201.csv")
+mx.death <- gather(mx.death, date, deaths, X17.03.2020:ncol(mx.death), factor_key=F)
+mx.death$date <- sub('.', '', mx.death$date)
+mx.death$date <- as.Date(mx.death$date, format = "%d.%m.%Y")
+
+df.mexico <- mx.conf %>% left_join(mx.sosp[,c("cve_ent", "date", "sospechosos")], by = c("cve_ent", "date"))
+df.mexico <- df.mexico %>% left_join(mx.death[,c("cve_ent", "date", "deaths")], by = c("cve_ent", "date"))
+df.mexico$sospechosos <- replace_na(df.mexico$sospechosos, 0)
+df.mexico$deaths <- replace_na(df.mexico$deaths, 0)
+df.mexico <- df.mexico %>% mutate(cases = confirmados + sospechosos)
+df.mexico <- df.mexico %>% dplyr::select(date, county = nombre, fips = cve_ent, 
+                                  cases.daily = cases, deaths.daily = deaths, 
+                                  population = poblacion)
+df.mexico <- df.mexico %>% group_by(fips) %>% arrange(date) %>% 
+  mutate(cases = cumsum(cases.daily))
+df.mexico <- df.mexico %>% group_by(fips) %>% arrange(date) %>% 
+  mutate(deaths = cumsum(deaths.daily))
+df.mexico <- df.mexico %>% mutate(county2 = case_when(county == "Tijuana" ~ "Tijuana, B.C.",
+                               county == "Mexicali" ~ "Mexicali, B.C.",
+                               county == "San Luis Rio Colorado" ~ "SLRC, Son.",
+                               fips == "8037" ~ "Juárez, Chih.",
+                               county == "Nuevo Laredo" ~ "Nuevo Laredo, Tamps.",
+                               fips == "28022" ~ "Matamoros, Tamps."))
+df.mexico$country <- "Mexico"
+border.mx.fips <- c("2004", "2002", "2003", "2005",
+                    "26055", "26048", "26070", "26017", "26004", "26060", "26043", "26059", "26019", "26039", "26002",
+                    "8035", "8005", "8037", "8028", "8053", "8052", "8042",
+                    "5023", "5002", "5014", "5025", "5012", "5013", "5022",
+                    "19005",
+                    "28027", "28014", "28024", "28025", "28007", "28015", "28032", "28033", "28022", "28040")
+
+df.mexico <- df.mexico %>% 
+  mutate(border = ifelse(fips %in% border.mx.fips, "Yes", "No"))
+#df.mexico %>% filter(county %in% c("Tijuana", "Tecate", "Mexicali",
+#                                   "San Luis Rio Colorado", "Naco", "Nogales", 
+#                                   "Agua Prieta", "El Berrendo", "Puerto Palomas",
+#                                   "San Jeronimo", "El Porvenir", "Ojinaga", "Acuña",
+#                                   "Piedras Negras", "Colombia", "Rio Bravo", "Nuevo Progreso"))
+
+#Use mxmaps as has population data
+#df.mxmap <- as.data.frame(df.mexico)
+df.mxmap <- as.data.frame(df_mxmunicipio)
+df.mxmap$fips <- as.numeric(df.mxmap$region)
+df.mxmap <- df.mxmap %>% 
+  mutate(north = ifelse(state_abbr %in% c("BC", "BCS", "SON", "CHIH", "COAH", "NL", "TAM"), "Yes", "No"))
+df.mxmap <- df.mxmap %>% 
+  mutate(border = ifelse(fips %in% border.mx.fips, "Yes", "No"))
+df.mxmap$group <- NA
+
+#Get State names
+df.mexico <- df.mexico %>% left_join(df.mxmap %>% dplyr::select(fips, state = state_name, state_abbr), by = "fips")
+df.mexico <- df.mexico %>%
+  mutate(north = ifelse(state_abbr %in% c("BC", "BCS", "SON", "CHIH", "COAH", "NL", "TAM"), "Yes", "No"))
+#df.mexico <- df.mexico %>% filter(north == "Yes")
+df.mexico <- df.mexico %>% dplyr::select(date, county, state, fips, cases, deaths, population, 
+                                  country, border, cases.daily, deaths.daily, county2, north)
+```
+
+```{r Create rates/averages, include=FALSE}
+#Merge to US dataframe above
+df <- bind_rows(df.us, df.mexico)
+
+#7-day average
+df <- df %>% group_by(fips, country) %>% arrange(date) %>% 
+  mutate(cases.avg = rollmean(cases.daily, 7, align='right', fill=0))
+df <- df %>% group_by(fips, country) %>% arrange(date) %>% 
+  mutate(deaths.avg = rollmean(deaths.daily, 7, align='right', fill=0))
+
+#Cumulative rate per 100,000
+df <- df %>% mutate(rate.cases.cum = cases/population * 100000)
+df <- df %>% mutate(rate.deaths.cum = deaths/population * 100000)
+
+#Daily rate per 100,000
+df <- df %>% mutate(rate.cases.daily = cases.daily/population * 100000)
+df <- df %>% mutate(rate.deaths.daily = deaths.daily/population * 100000)
+
+#7-day average rate
+df <- df %>% group_by(fips, country) %>% arrange(date) %>% 
+  mutate(rate.cases.avg = rollmean(rate.cases.daily, 7, align='right', fill=0))
+df <- df %>% group_by(fips, country) %>% arrange(date) %>% 
+  mutate(rate.deaths.avg = rollmean(rate.deaths.daily, 7, align='right', fill=0))
+  
+#Order counties for ploting
+df$county2 <- factor(df$county2, 
+                    levels = c("San Diego, CA", "Tijuana, B.C.",
+                               "Imperial County, CA", "Mexicali, B.C.",
+                               "Yuma, AZ", "SLRC, Son.",
+                               "El Paso, TX", "Juárez, Chih.",
+                               "Webb/Laredo, TX", "Nuevo Laredo, Tamps.",
+                               "Cameron/Brownsville, TX", "Matamoros, Tamps."))
+
+#Create dyad city indicator
+df <- df %>% 
+  mutate(dyad = case_when(county %in% c("San Diego", "Tijuana") ~ "San Diego/Tijuana",
+                          county %in% c("Imperial", "Mexicali") ~ "Imperial County/Mexicali",
+                          county %in% c("Yuma", "San Luis Rio Colorado") ~ "Yuma/SLRC",
+                          county %in% c("El Paso") ~ "El Paso/Juarez",
+                          fips %in% c("8037") ~ "El Paso/Juarez",
+                          county %in% c("Webb", "Nuevo Laredo") ~ "Webb/Nuevo Laredo",
+                          fips %in% c("28022") ~ "Cameron/Matamoros",
+                          county %in% c("Cameron") ~ "Cameron/Matamoros"))
+df$dyad <- factor(df$dyad, levels = c("San Diego/Tijuana", "Imperial County/Mexicali",
+                                      "Yuma/SLRC", "El Paso/Juarez",
+                                      "Webb/Nuevo Laredo", "Cameron/Matamoros"))
+  
+#Create dyad city indicator
+df <- df %>% 
+    mutate(dyad = case_when(county %in% c("San Diego", "Tijuana") ~ "San Diego/Tijuana",
+                          county %in% c("Imperial", "Mexicali") ~ "Imperial County/Mexicali",
+                          county %in% c("Yuma", "San Luis Rio Colorado") ~ "Yuma/SLRC",
+                          county %in% c("El Paso") ~ "El Paso/Juarez",
+                          fips %in% c("8037") ~ "El Paso/Juarez",
+                          county %in% c("Webb", "Nuevo Laredo") ~ "Webb/Nuevo Laredo",
+                          fips %in% c("28022") ~ "Cameron/Matamoros",
+                          county %in% c("Cameron") ~ "Cameron/Matamoros"))
+df$dyad <- factor(df$dyad, levels = c("San Diego/Tijuana", "Imperial County/Mexicali",
+                                      "Yuma/SLRC", "El Paso/Juarez",
+                                      "Webb/Nuevo Laredo", "Cameron/Matamoros"))
+
+df.all <- df %>% filter(date <= "2021-11-30")
+df.1 <- df %>% filter(date <= "2020-06-01")
+df.2 <- df %>% filter(date > "2020-06-01" & date <= "2020-09-01")
+df.3 <- df %>% filter(date > "2020-09-01" & date <= "2020-12-01")
+df.4 <- df %>% filter(date > "2020-12-01" & date <= "2021-02-01")
+df.5 <- df %>% filter(date > "2021-02-01" & date <= "2021-06-01")
+df.6 <- df %>% filter(date > "2021-06-01" & date <= "2021-11-30")
+
+
+df.sall <- df.all %>% group_by(county, state, fips) %>% summarise(cases = max(cases), deaths = max(deaths), population = max(population), county2 = first(county2), country = first(country), border = first(border), south = first(south), north = first(north))
+df.sall <- df.sall %>% mutate(deaths = ifelse(deaths < 0, 0, deaths)) #new line
+df.sall <- df.sall %>% mutate(case.rate = round((cases/population)*100000,1))
+df.sall <- df.sall %>% mutate(death.rate = round((deaths/(cases))*100,1))
+df.sall <- df.sall %>% mutate(death.rate.pop = round((deaths/population)*100000,1))
+df.sall <- df.sall %>% group_by(country, border) %>% mutate(quintile.case = ntile(case.rate, 5))
+df.sall <- df.sall %>% group_by(country, border) %>% mutate(quintile.death = ntile(death.rate.pop, 5))
+df.sall <- df.sall %>% ungroup()
+
+df.s1 <- df.1 %>% group_by(county, state, fips) %>% summarise(cases = max(cases), deaths = max(deaths), population = max(population), county2 = first(county2), country = first(country), border = first(border), south = first(south), north = first(north))
+df.s1.sub <- df.s1
+df.s1 <- df.s1 %>% mutate(deaths = ifelse(deaths < 0, 0, deaths)) #new line
+df.s1 <- df.s1 %>% mutate(case.rate = round((cases/population)*100000,1))
+df.s1 <- df.s1 %>% mutate(death.rate = round((deaths/(cases))*100,1))
+df.s1 <- df.s1 %>% mutate(death.rate.pop = round((deaths/population)*100000,1))
+df.s1 <- df.s1 %>% group_by(country, border) %>% mutate(quintile.case = ntile(case.rate, 5))
+df.s1 <- df.s1 %>% group_by(country, border) %>% mutate(quintile.death = ntile(death.rate.pop, 5))
+df.s1 <- df.s1 %>% ungroup()
+
+df.s2 <- df.2 %>% group_by(county, state, fips) %>% summarise(cases = max(cases), deaths = max(deaths), population = max(population), county2 = first(county2), country = first(country), border = first(border), south = first(south), north = first(north))
+df.s2.sub <- df.s2
+df.s2$cases <- df.s2$cases - df.s1.sub$cases
+df.s2$deaths <- df.s2$deaths - df.s1.sub$deaths
+df.s2 <- df.s2 %>% mutate(deaths = ifelse(deaths < 0, 0, deaths)) #new line
+df.s2 <- df.s2 %>% mutate(case.rate = round((cases/population)*100000,1))
+df.s2 <- df.s2 %>% mutate(death.rate = round((deaths/(cases))*100,1))
+df.s2 <- df.s2 %>% mutate(death.rate.pop = round((deaths/population)*100000,1))
+df.s2 <- df.s2 %>% group_by(country, border) %>% mutate(quintile.case = ntile(case.rate, 5))
+df.s2 <- df.s2 %>% group_by(country, border) %>% mutate(quintile.death = ntile(death.rate.pop, 5))
+df.s2 <- df.s2 %>% ungroup()
+
+df.s3 <- df.3 %>% group_by(county, state, fips) %>% summarise(cases = max(cases), deaths = max(deaths), population = max(population), county2 = first(county2), country = first(country), border = first(border), south = first(south), north = first(north))
+df.s3.sub <- df.s3
+df.s3$cases <- df.s3$cases - df.s2.sub$cases
+df.s3$deaths <- df.s3$deaths - df.s2.sub$deaths
+df.s3 <- df.s3 %>% mutate(deaths = ifelse(deaths < 0, 0, deaths)) #new line
+df.s3 <- df.s3 %>% mutate(case.rate = round((cases/population)*100000,1))
+df.s3 <- df.s3 %>% mutate(death.rate = round((deaths/(cases))*100,1))
+df.s3 <- df.s3 %>% mutate(death.rate.pop = round((deaths/population)*100000,1))
+df.s3 <- df.s3 %>% group_by(country, border) %>% mutate(quintile.case = ntile(case.rate, 5))
+df.s3 <- df.s3 %>% group_by(country, border) %>% mutate(quintile.death = ntile(death.rate.pop, 5))
+df.s3 <- df.s3 %>% ungroup()
+
+df.s4 <- df.4 %>% group_by(county, state, fips) %>% summarise(cases = max(cases), deaths = max(deaths), population = max(population), county2 = first(county2), country = first(country), border = first(border), south = first(south), north = first(north))
+df.s4.sub <- df.s4
+df.s4$cases <- df.s4$cases - df.s3.sub$cases
+df.s4$deaths <- df.s4$deaths - df.s3.sub$deaths
+df.s4 <- df.s4 %>% mutate(deaths = ifelse(deaths < 0, 0, deaths)) #new line
+df.s4 <- df.s4 %>% mutate(case.rate = round((cases/population)*100000,1))
+df.s4 <- df.s4 %>% mutate(death.rate = round((deaths/(cases))*100,1))
+df.s4 <- df.s4 %>% mutate(death.rate.pop = round((deaths/population)*100000,1))
+df.s4 <- df.s4 %>% group_by(country, border) %>% mutate(quintile.case = ntile(case.rate, 5))
+df.s4 <- df.s4 %>% group_by(country, border) %>% mutate(quintile.death = ntile(death.rate.pop, 5))
+df.s4 <- df.s4 %>% ungroup()
+
+df.s5 <- df.5 %>% group_by(county, state, fips) %>% summarise(cases = max(cases), deaths = max(deaths), population = max(population), county2 = first(county2), country = first(country), border = first(border), south = first(south), north = first(north))
+df.s5.sub <- df.s5
+df.s5$cases <- df.s5$cases - df.s4.sub$cases
+df.s5$deaths <- df.s5$deaths - df.s4.sub$deaths
+df.s5 <- df.s5 %>% mutate(deaths = ifelse(deaths < 0, 0, deaths)) #new line
+df.s5 <- df.s5 %>% mutate(case.rate = round((cases/population)*100000,1))
+df.s5 <- df.s5 %>% mutate(death.rate = round((deaths/(cases))*100,1))
+df.s5 <- df.s5 %>% mutate(death.rate.pop = round((deaths/population)*100000,1))
+df.s5 <- df.s5 %>% group_by(country, border) %>% mutate(quintile.case = ntile(case.rate, 5))
+df.s5 <- df.s5 %>% group_by(country, border) %>% mutate(quintile.death = ntile(death.rate.pop, 5))
+df.s5 <- df.s5 %>% ungroup()
+
+df.s6 <- df.6 %>% group_by(county, state, fips) %>% summarise(cases = max(cases), deaths = max(deaths), population = max(population), county2 = first(county2), country = first(country), border = first(border), south = first(south), north = first(north))
+df.s6.sub <- df.s6
+df.s6$cases <- df.s6$cases - df.s5.sub$cases
+df.s6$deaths <- df.s6$deaths - df.s5.sub$deaths
+df.s6 <- df.s6 %>% mutate(deaths = ifelse(deaths < 0, 0, deaths)) #new line
+df.s6 <- df.s6 %>% mutate(case.rate = round((cases/population)*100000,1))
+df.s6 <- df.s6 %>% mutate(death.rate = round((deaths/(cases))*100,1))
+df.s6 <- df.s6 %>% mutate(death.rate.pop = round((deaths/population)*100000,1))
+df.s6 <- df.s6 %>% group_by(country, border) %>% mutate(quintile.case = ntile(case.rate, 5))
+df.s6 <- df.s6 %>% group_by(country, border) %>% mutate(quintile.death = ntile(death.rate.pop, 5))
+df.s6 <- df.s6 %>% ungroup()
+
+#write_csv(df, "border.csv")
+```
+
+```{r Create rates/averages, include=FALSE}
+# df.border <- df.all %>% select(county, state, country, border)
+# df.border <- df.border %>% unique
+# df.border <- df.border %>% filter(border == "Yes")
+# df.border <- df.border %>% filter(county == "Grant")
+```
+
+```{r Import USA data for indirect standardization, include=FALSE}
+#Import cdc dataset for standardization
+
+df.cdc <- jsonlite::fromJSON("https://data.cdc.gov/resource/9bhg-hcku.json?$limit=999999")
+df.cdc <- df.cdc %>% mutate(end_date = ymd(str_sub(end_date, 1, 10)),
+                            start_date = ymd(str_sub(start_date, 1, 10)))
+
+df.cdc <- df.cdc %>% filter(sex == "All Sexes" & state == "United States") #subset only all data
+df.cdc <- df.cdc %>% filter(!age_group %in% c("0-17 years", "18-29 years",
+                                                  "30-39 years", "40-49 years", "50-64 years", "All Ages"))
+
+df.cdc.all <- df.cdc %>% filter(group == "By Month" &
+                                end_date <= ymd("2021-11-30"))
+df.cdc.1 <- df.cdc %>% filter(group == "By Month" &
+                                end_date <= ymd("2020-06-01"))
+df.cdc.2 <- df.cdc %>% filter(group == "By Month" &
+                                end_date > ymd("2020-06-01") & end_date <= ymd("2020-09-01"))
+df.cdc.3 <- df.cdc %>% filter(group == "By Month" &
+                                end_date > ymd("2020-09-01") & end_date <= ymd("2020-12-01"))
+df.cdc.4 <- df.cdc %>% filter(group == "By Month" &
+                                end_date > ymd("2020-12-01") & end_date <= ymd("2021-02-01"))
+df.cdc.5 <- df.cdc %>% filter(group == "By Month" &
+                                end_date > ymd("2021-02-01") & end_date <= ymd("2021-06-01"))
+df.cdc.6 <- df.cdc %>% filter(group == "By Month" &
+                                end_date > ymd("2021-06-01") & end_date <= ymd("2021-11-30"))
+
+#Import ACS population data by age group
+df.census.age <- get_acs(geography = "us",
+              variables = c( "B01001_003","B01001_004","B01001_005","B01001_006",
+                             "B01001_007","B01001_008","B01001_009","B01001_010",
+                             "B01001_011","B01001_012","B01001_013","B01001_014",
+                             "B01001_015","B01001_016","B01001_017","B01001_018",
+                             "B01001_019","B01001_020","B01001_021","B01001_022",
+                             "B01001_023","B01001_024","B01001_025",
+                             "B01001_027","B01001_028","B01001_029","B01001_030",
+                             "B01001_031","B01001_032","B01001_033","B01001_034",
+                             "B01001_035","B01001_036","B01001_037","B01001_038","B01001_039",
+                             "B01001_040","B01001_041","B01001_042","B01001_043",
+                             "B01001_044","B01001_045","B01001_046","B01001_047",
+                             "B01001_048","B01001_049"),
+              year = 2019)
+df.census.age <- df.census.age %>% dplyr::select(!moe) %>% spread(variable, estimate)
+df.census.age <- df.census.age %>% 
+  mutate(`1-4 years` = B01001_003 + B01001_027, 
+  `5-14 years` = B01001_004 + B01001_005 + B01001_028 + B01001_029,
+  `15-24 years` = B01001_006 + B01001_007 + B01001_008 + B01001_009 + B01001_010 +
+    B01001_030 + B01001_031 + B01001_032 + B01001_033 + B01001_034,
+  `25-34 years` = B01001_011 + B01001_012 + B01001_035 + B01001_036,
+  `35-44 years` = B01001_013 + B01001_014 + B01001_037 + B01001_038,
+  `45-54 years` = B01001_015 + B01001_016 + B01001_039 + B01001_040,
+  `55-64 years` = B01001_017 + B01001_018 + B01001_019 + B01001_041 + B01001_042 + B01001_043,
+  `65-74 years` = B01001_020 + B01001_021 + B01001_022 + B01001_044 + B01001_045 + B01001_046,
+  `75-84 years` = B01001_023 + B01001_024 + B01001_047 + B01001_048,
+  `85 years and over` = B01001_025 + B01001_049)
+df.census.age <- df.census.age %>% 
+  dplyr::select(`1-4 years`:`85 years and over`) %>% 
+  gather(age_group, population)
+
+# Merge back to CDC dataset and clean up
+# 
+# df.cdc.all <- df.cdc.all %>% select(age_group, end_date, covid_19_deaths) %>% pivot_wider(
+#     id = "age_group",
+#     names_from = "end_date",
+#     values_from = "covid_19_deaths"
+#   )
+# df.cdc.all <- df.cdc.all %>% mutate(across(2:ncol(df.cdc.all), ~ as.numeric(.)))
+# df.cdc.all <- df.cdc.all %>% mutate(covid_19_deaths = rowSums(df.cdc.all[, c(2:ncol(df.cdc.all))]))
+# df.cdc.all <- df.cdc.all %>% select(age_group, covid_19_deaths)
+# df.cdc.all[2, "covid_19_deaths"] <- df.cdc.all[1, "covid_19_deaths"] + df.cdc.all[2, "covid_19_deaths"]
+# df.cdc.all <- df.cdc.all[2:11, c("age_group", "covid_19_deaths")]
+# df.cdc.all <- df.cdc.all %>% left_join(df.census.age, by = "age_group")
+# df.cdc.all <- df.cdc.all %>% mutate(rate = covid_19_deaths/population)
+# df.cdc.all <- df.cdc.all %>% mutate(rate.pop = round((covid_19_deaths/population)*100000,1))
+
+CDC.cleanup <- function(df.cdc) {
+  df.cdc$covid_19_deaths <- as.numeric(df.cdc$covid_19_deaths)
+  df.cdc <- df.cdc %>% select(age_group, end_date, covid_19_deaths) %>% pivot_wider(
+    id_cols = "age_group",
+    names_from = "end_date",
+    values_from = "covid_19_deaths"
+  )
+  #df.cdc <- df.cdc %>% mutate(across(2:ncol(df.cdc), ~ as.numeric(.)))
+  df.cdc <- df.cdc  %>% mutate(covid_19_deaths = rowSums(df.cdc[, c(2:ncol(df.cdc))]))
+  df.cdc <- df.cdc %>% select(age_group, covid_19_deaths)
+  df.cdc[2, "covid_19_deaths"] <- df.cdc[1, "covid_19_deaths"] + df.cdc[2, "covid_19_deaths"]
+  df.cdc <- df.cdc[2:11, c("age_group", "covid_19_deaths")]
+  df.cdc <- df.cdc %>% left_join(df.census.age, by = "age_group")
+  df.cdc <- df.cdc %>% mutate(rate = covid_19_deaths/population)
+  df.cdc <- df.cdc %>% mutate(rate.pop = round((covid_19_deaths/population)*100000,1))
+  return(df.cdc[1:nrow(df.cdc),])
+}
+
+df.cdc.all <- CDC.cleanup(df.cdc.all)
+df.cdc.1 <- CDC.cleanup(df.cdc.1)
+df.cdc.2 <- CDC.cleanup(df.cdc.2)
+df.cdc.3 <- CDC.cleanup(df.cdc.3)
+df.cdc.4 <- CDC.cleanup(df.cdc.4)
+df.cdc.5 <- CDC.cleanup(df.cdc.5)
+df.cdc.6 <- CDC.cleanup(df.cdc.6)
+
+#Import ACS population data by age group for each county
+df.census.age.county <- get_acs(geography = "county",
+              variables = c( "B01001_003","B01001_004","B01001_005","B01001_006",
+                             "B01001_007","B01001_008","B01001_009","B01001_010",
+                             "B01001_011","B01001_012","B01001_013","B01001_014",
+                             "B01001_015","B01001_016","B01001_017","B01001_018",
+                             "B01001_019","B01001_020","B01001_021","B01001_022",
+                             "B01001_023","B01001_024","B01001_025",
+                             "B01001_027","B01001_028","B01001_029","B01001_030",
+                             "B01001_031","B01001_032","B01001_033","B01001_034",
+                             "B01001_035","B01001_036","B01001_037","B01001_038","B01001_039",
+                             "B01001_040","B01001_041","B01001_042","B01001_043",
+                             "B01001_044","B01001_045","B01001_046","B01001_047",
+                             "B01001_048","B01001_049"),
+              year = 2019)
+df.census.age.county$fips <- as.numeric(df.census.age.county$GEOID)
+df.census.age.county <- df.census.age.county %>% dplyr::select(!moe) %>% spread(variable, estimate)
+df.census.age.county <- df.census.age.county %>% 
+  mutate(`1-4 years` = B01001_003 + B01001_027, 
+  `5-14 years` = B01001_004 + B01001_005 + B01001_028 + B01001_029,
+  `15-24 years` = B01001_006 + B01001_007 + B01001_008 + B01001_009 + B01001_010 +
+    B01001_030 + B01001_031 + B01001_032 + B01001_033 + B01001_034,
+  `25-34 years` = B01001_011 + B01001_012 + B01001_035 + B01001_036,
+  `35-44 years` = B01001_013 + B01001_014 + B01001_037 + B01001_038,
+  `45-54 years` = B01001_015 + B01001_016 + B01001_039 + B01001_040,
+  `55-64 years` = B01001_017 + B01001_018 + B01001_019 + B01001_041 + B01001_042 + B01001_043,
+  `65-74 years` = B01001_020 + B01001_021 + B01001_022 + B01001_044 + B01001_045 + B01001_046,
+  `75-84 years` = B01001_023 + B01001_024 + B01001_047 + B01001_048,
+  `85 years and over` = B01001_025 + B01001_049)
+df.census.age.county.long <- df.census.age.county %>% 
+  dplyr::select(fips, NAME, `1-4 years`:`85 years and over`) %>% 
+  gather(age_group, population, `1-4 years`:`85 years and over`)
+```
+
+```{r Import Mexican data for age adjusted rates, include=FALSE}
+#Import COVID data by patient
+#https://www.gob.mx/salud/documentos/datos-abiertos-152127
+
+df.mx.abierto <- read.csv("Data/211201COVID19MEXICO.csv")
+df.mx.abierto <- df.mx.abierto %>% 
+  mutate(deaths = case_when(FECHA_DEF == "9999-99-99" ~ 0,
+                                            TRUE ~ 1))
+df.mx.abierto <- df.mx.abierto %>% 
+  mutate(age_group = case_when(EDAD < 5 ~ "1-4 years",
+                            EDAD >4 & EDAD <15 ~ "5-14 years",
+                            EDAD >14 & EDAD <25 ~ "15-24 years",
+                            EDAD >24 & EDAD <35 ~  "25-34 years",
+                            EDAD >34 & EDAD <45 ~  "35-44 years",
+                            EDAD >44 & EDAD <55 ~ "45-54 years",
+                            EDAD >54 & EDAD <65 ~  "55-64 years",
+                            EDAD >64 & EDAD <75 ~  "65-74 years",
+                            EDAD >74 ~ "75 years and over")) 
+
+df.dgb.mx.all <- df.mx.abierto %>% filter(FECHA_INGRESO <= "2021-11-30")
+df.dgb.mx.1 <- df.mx.abierto %>% filter(FECHA_INGRESO <= "2020-06-01")
+df.dgb.mx.2 <- df.mx.abierto %>% filter(FECHA_INGRESO > "2020-06-01" & FECHA_INGRESO <= "2020-09-01")
+df.dgb.mx.3 <- df.mx.abierto %>% filter(FECHA_INGRESO > "2020-09-01" & FECHA_INGRESO <= "2020-12-01")
+df.dgb.mx.4 <- df.mx.abierto %>% filter(FECHA_INGRESO > "2020-12-01" & FECHA_INGRESO <= "2021-02-01")
+df.dgb.mx.5 <- df.mx.abierto %>% filter(FECHA_INGRESO > "2021-02-01" & FECHA_INGRESO <= "2021-06-01")
+df.dgb.mx.6 <- df.mx.abierto %>% filter(FECHA_INGRESO > "2021-06-01" & FECHA_INGRESO <= "2021-11-30")
+
+DGB.MX.new <- function(df.mx.abierto) {
+  df.dgb.mx <- df.mx.abierto %>% dplyr::select(age_group, deaths)
+  df.dgb.mx <- df.dgb.mx %>% filter(deaths == 1) %>% group_by(age_group) %>% count()
+  df.dgb.mx <- df.dgb.mx %>% dplyr::select(age_group, covid_19_deaths = n)
+  df.dgb.mx <- df.dgb.mx %>% ungroup()
+  
+  #Import population data
+  #http://en.www.inegi.org.mx/temas/estructura/default.html#Tabular_Data
+  df.dgb.mx <- df.dgb.mx %>% 
+    mutate(population = case_when(age_group == "1-4 years" ~ 10047365,
+                                  age_group == "5-14 years" ~ 21707919,
+                                  age_group == "15-24 years" ~ 10806690 + 10422095,
+                                  age_group ==  "25-34 years" ~ 9993001 + 9420827,
+                                  age_group ==  "35-44 years" ~ 9020276            + 8503586,
+                                  age_group == "45-54 years" ~ 7942413 + 7037532,
+                                  age_group ==  "55-64 years" ~ 5695958 + 4821062,
+                                  age_group ==  "65-74 years" ~ 3645077 + 2647340,
+                                  age_group ==  "75 years and over" ~ 1814582 + 1175364 + 659245 + 266806 + 95205 + 18295))
+  
+  #Calculate rates
+  df.dgb.mx <- df.dgb.mx %>% mutate(rate = covid_19_deaths/population)
+  df.dgb.mx <- df.dgb.mx %>% mutate(rate.pop = round((covid_19_deaths/population)*100000,1))
+  
+  return(df.dgb.mx)
+}
+
+DGB.MX <- function(df.mx.abierto) {
+  df.dgb.mx <- df.mx.abierto %>% filter(deaths == 1) %>% group_by(age_group) %>% count()
+  df.dgb.mx <- df.dgb.mx %>% dplyr::select(age_group, covid_19_deaths = n)
+  df.dgb.mx <- df.dgb.mx %>% ungroup()
+  
+  #Import population data
+  #http://en.www.inegi.org.mx/temas/estructura/default.html#Tabular_Data
+  df.dgb.mx <- df.dgb.mx %>% 
+    mutate(population = case_when(age_group == "1-4 years" ~ 10528322,
+                                  age_group == "5-14 years" ~ 21987474,
+                                  age_group == "15-24 years" ~ 20918383,
+                                  age_group ==  "25-34 years" ~ 17258975,
+                                  age_group ==  "35-44 years" ~ 15302213,
+                                  age_group == "45-54 years" ~ 10993021,
+                                  age_group ==  "55-64 years" ~ 7011831,
+                                  age_group ==  "65-74 years" ~ 4191199,
+                                  age_group ==  "75 years and over" ~ 2747714))
+  
+  #Calculate rates
+  df.dgb.mx <- df.dgb.mx %>% mutate(rate = covid_19_deaths/population)
+  df.dgb.mx <- df.dgb.mx %>% mutate(rate.pop = round((covid_19_deaths/population)*100000,1))
+  
+  return(df.dgb.mx)
+}
+
+df.dgb.mx.all <- DGB.MX.new(df.dgb.mx.all)
+df.dgb.mx.1 <- DGB.MX.new(df.dgb.mx.1)
+df.dgb.mx.2 <- DGB.MX.new(df.dgb.mx.2)
+df.dgb.mx.3 <- DGB.MX.new(df.dgb.mx.3)
+df.dgb.mx.4 <- DGB.MX.new(df.dgb.mx.4)
+df.dgb.mx.5 <- DGB.MX.new(df.dgb.mx.5)
+df.dgb.mx.6 <- DGB.MX.new(df.dgb.mx.6)
+
+# #Import municipality by age data
+mp_2020 <- read.csv("Data/INEGI_exporta_14_1_2022_17_28_16.csv")
+colnames(mp_2020) <- c("location", "county", "total", "0-4", "5-9", "10-14", "15-19", "20-24", "25-29", "30-34", "35-39", "40-44", "45-49", "50-54", "55-59", "60-64", "65-69", "70-74", "75-79", "80-84", "85+", "NS")
+mp_2020 <- mp_2020[6:nrow(mp_2020),]
+mp_2020$location <- str_replace(mp_2020$location, " ", "")
+mp_states <- mp_2020[nchar(mp_2020$location) < 3, ]
+mp_2020 <- mp_2020[nchar(mp_2020$location) > 2, ]
+colnames(mp_states)[2] <- "state"
+mp_states_s <- mp_states[,1:2]
+mp_2020$fips <- mp_2020$location %>% as.character()
+mp_2020$location <- mp_2020$location %>% strtrim(2)
+mp_2020 <- mp_2020 %>% left_join(mp_states_s, by = c("location"))
+mp_2020 <- mp_2020[,c(2, 24, 23, 4:21)]
+mp_2020 <- mp_2020 %>% mutate_all(funs(str_replace(., ",", "")))
+mp_2020[4:21] <- mp_2020[4:21] %>% mutate_all(funs(as.numeric(.)))
+mp_2020 <- mp_2020 %>%
+  mutate(`1-4 years` = `0-4`,
+           `5-14 years` = `5-9` + `10-14`,
+           `15-24 years` = `15-19` + `20-24`,
+           `25-34 years` = `25-29` + `30-34`,
+           `35-44 years` = `35-39` + `40-44`,
+           `45-54 years` = `45-49` + `50-54`,
+           `55-64 years` = `55-59` + `60-64`,
+           `65-74 years` = `65-69` + `70-74`,
+           `75 years and over` = `75-79` + `80-84` + `85+`)
+
+df.poblacion.municipio.long <- mp_2020 %>%
+  dplyr::select(fips, county, state, `1-4 years`:`75 years and over`) %>%
+  gather(age_group, population, `1-4 years`:`75 years and over`)
+df.poblacion.municipio.long$population <- replace_na(df.poblacion.municipio.long$population, 1)
+df.poblacion.municipio.long$fips <- as.numeric(df.poblacion.municipio.long$fips)
+df.poblacion.municipio.long <- df.poblacion.municipio.long %>%
+  mutate(state = case_when(state == "Coahuila de Zaragoza" ~ "Coahuila",
+                           state == "Veracruz de Ignacio de la Llave" ~ "Veracruz",
+                           state == "Michoacán de Ocampo" ~ "Michoacán",
+                           TRUE ~ state))
+df.poblacion.municipio.long <- df.poblacion.municipio.long %>%
+  mutate(county = case_when(county == "Zacualpan de Amilpas" ~ "Zacualpan",
+                            TRUE ~ county))
+df.poblacion.municipio.long$county <- trimws(df.poblacion.municipio.long$county)
+df.poblacion.municipio.long <- df.poblacion.municipio.long %>% filter(!is.na(fips))
+
+# #Import municipality by age data
+df.poblacion.municipio.1 <- read.csv("Data/municipio_poblacion.csv")
+df.poblacion.municipio.1 <- df.poblacion.municipio.1 %>%
+  dplyr::select(state = Estado, county = Municipio, age_group = Grupo, population = Poblacion)
+df.poblacion.municipio.1$state <- sub('...', '', df.poblacion.municipio.1$state)
+df.poblacion.municipio.1$county <- str_replace(df.poblacion.municipio.1$county, "[*]", "")
+df.poblacion.municipio.1$county <- trimws(df.poblacion.municipio.1$county)
+df.poblacion.municipio.1 <- df.poblacion.municipio.1 %>%
+  mutate(state = case_when(state == "Coahuila de Zaragoza" ~ "Coahuila",
+                           state == "Veracruz de Ignacio de la Llave" ~ "Veracruz",
+                           state == "Michoacán de Ocampo" ~ "Michoacán",
+                           TRUE ~ state))
+df.poblacion.municipio.1 <- df.poblacion.municipio.1 %>%
+  mutate(county = case_when(county == "Zacualpan de Amilpas" ~ "Zacualpan",
+                            TRUE ~ county))
+df.poblacion.municipio.1 <- df.poblacion.municipio.1 %>%
+  left_join(df.sall %>% ungroup() %>% dplyr::select(county, state, fips),
+                                  by = c("county", "state"))
+df.poblacion.municipio.1 <- df.poblacion.municipio.1 %>% filter(!is.na(fips))
+
+#Go to wide to consolidate age groups
+df.poblacion.municipio.1 <- df.poblacion.municipio.1 %>%
+  group_by(fips) %>% spread(age_group, population)
+df.poblacion.municipio.1 <- df.poblacion.municipio.1 %>%
+  mutate(`1-4 years` = `00-04 años`,
+  `5-14 years` = `05-09 años` + `10-14 años`,
+  `15-24 years` = `15-19 años` + `20-24 años`,
+  `25-34 years` = `25-29 años` + `30-34 años`,
+  `35-44 years` = `35-39 años` + `40-44 años`,
+  `45-54 years` = `45-49 años` + `50-54 años`,
+  `55-64 years` = `55-59 años` + `60-64 años`,
+  `65-74 years` = `65-69 años` + `70-74 años`,
+  `75 years and over` = `75 años y más`)
+df.poblacion.municipio.long.1 <- df.poblacion.municipio.1 %>%
+  dplyr::select(fips, county, state, `1-4 years`:`75 years and over`) %>%
+  gather(age_group, population, `1-4 years`:`75 years and over`)
+df.poblacion.municipio.long.1 <- df.poblacion.municipio.long.1 %>% filter(!is.na(fips))
+df.poblacion.municipio.long.1$population <- replace_na(df.poblacion.municipio.long.1$population, 1)
+
+```
+
+```{r Indirect Standardization US, include=FALSE}
+#Create function to calculate SMR
+
+#Calculate SIR and age adjusted rates 
+list.us <- as.vector(unique(df.sall %>% ungroup() %>% filter(country == "USA" & !is.na(fips)) %>%
+                                dplyr::select(fips)))
+list.us <- as.vector(list.us$fips)
+df.census.age.county.long.f <- df.census.age.county.long %>% filter(fips %in% list.us)
+list.us2 <- as.vector(unique(df.census.age.county.long.f$fips))
+
+ageadjust.func.us.all <- function(x) {
+    ageadjust.indirect(
+    df.sall %>% ungroup() %>% arrange(fips) %>% 
+      filter(country == "USA" & fips == x) %>% dplyr::select(deaths), 
+    # The number of events observed in the population of interest
+    df.census.age.county.long.f %>% arrange(fips) %>% filter(fips == x) %>% dplyr::select(population), 
+    # The population by age group in the population of interest
+    df.cdc.all %>% dplyr::select(covid_19_deaths), # The number of events observed in the standard population
+    df.cdc.all %>% dplyr::select(population), # The population by age group in the standard population
+    df.cdc.all %>% dplyr::select(rate), # The age specific death rates in the standard population
+    conf.level = 0.95) # The confidence level for your confidence intervals
+}
+
+ageadjust.func.us.1 <- function(x) {
+    ageadjust.indirect(
+    df.s1 %>% ungroup() %>% arrange(fips) %>% 
+      filter(country == "USA" & fips == x) %>% dplyr::select(deaths), 
+    # The number of events observed in the population of interest
+    df.census.age.county.long.f %>% arrange(fips) %>% filter(fips == x) %>% dplyr::select(population), 
+    # The population by age group in the population of interest
+    df.cdc.1 %>% dplyr::select(covid_19_deaths), # The number of events observed in the standard population
+    df.cdc.1 %>% dplyr::select(population), # The population by age group in the standard population
+    df.cdc.1 %>% dplyr::select(rate), # The age specific death rates in the standard population
+    conf.level = 0.95) # The confidence level for your confidence intervals
+}
+
+ageadjust.func.us.2 <- function(x) {
+    ageadjust.indirect(
+    df.s2 %>% ungroup() %>% arrange(fips) %>% 
+      filter(country == "USA" & fips == x) %>% dplyr::select(deaths), 
+    # The number of events observed in the population of interest
+    df.census.age.county.long.f %>% arrange(fips) %>% filter(fips == x) %>% dplyr::select(population), 
+    # The population by age group in the population of interest
+    df.cdc.2 %>% dplyr::select(covid_19_deaths), # The number of events observed in the standard population
+    df.cdc.2 %>% dplyr::select(population), # The population by age group in the standard population
+    df.cdc.2 %>% dplyr::select(rate), # The age specific death rates in the standard population
+    conf.level = 0.95) # The confidence level for your confidence intervals
+}
+
+ageadjust.func.us.3 <- function(x) {
+    ageadjust.indirect(
+    df.s3 %>% ungroup() %>% arrange(fips) %>% 
+      filter(country == "USA" & fips == x) %>% dplyr::select(deaths), 
+    # The number of events observed in the population of interest
+    df.census.age.county.long.f %>% arrange(fips) %>% filter(fips == x) %>% dplyr::select(population), 
+    # The population by age group in the population of interest
+    df.cdc.3 %>% dplyr::select(covid_19_deaths), # The number of events observed in the standard population
+    df.cdc.3 %>% dplyr::select(population), # The population by age group in the standard population
+    df.cdc.3 %>% dplyr::select(rate), # The age specific death rates in the standard population
+    conf.level = 0.95) # The confidence level for your confidence intervals
+}
+
+ageadjust.func.us.4 <- function(x) {
+    ageadjust.indirect(
+    df.s4 %>% ungroup() %>% arrange(fips) %>% 
+      filter(country == "USA" & fips == x) %>% dplyr::select(deaths), 
+    # The number of events observed in the population of interest
+    df.census.age.county.long.f %>% arrange(fips) %>% filter(fips == x) %>% dplyr::select(population), 
+    # The population by age group in the population of interest
+    df.cdc.4 %>% dplyr::select(covid_19_deaths), # The number of events observed in the standard population
+    df.cdc.4 %>% dplyr::select(population), # The population by age group in the standard population
+    df.cdc.4 %>% dplyr::select(rate), # The age specific death rates in the standard population
+    conf.level = 0.95) # The confidence level for your confidence intervals
+}
+
+ageadjust.func.us.5 <- function(x) {
+    ageadjust.indirect(
+    df.s5 %>% ungroup() %>% arrange(fips) %>% 
+      filter(country == "USA" & fips == x) %>% dplyr::select(deaths), 
+    # The number of events observed in the population of interest
+    df.census.age.county.long.f %>% arrange(fips) %>% filter(fips == x) %>% dplyr::select(population), 
+    # The population by age group in the population of interest
+    df.cdc.5 %>% dplyr::select(covid_19_deaths), # The number of events observed in the standard population
+    df.cdc.5 %>% dplyr::select(population), # The population by age group in the standard population
+    df.cdc.5 %>% dplyr::select(rate), # The age specific death rates in the standard population
+    conf.level = 0.95) # The confidence level for your confidence intervals
+}
+
+ageadjust.func.us.6 <- function(x) {
+    ageadjust.indirect(
+    df.s6 %>% ungroup() %>% arrange(fips) %>% 
+      filter(country == "USA" & fips == x) %>% dplyr::select(deaths), 
+    # The number of events observed in the population of interest
+    df.census.age.county.long.f %>% arrange(fips) %>% filter(fips == x) %>% dplyr::select(population), 
+    # The population by age group in the population of interest
+    df.cdc.6 %>% dplyr::select(covid_19_deaths), # The number of events observed in the standard population
+    df.cdc.6 %>% dplyr::select(population), # The population by age group in the standard population
+    df.cdc.6 %>% dplyr::select(rate), # The age specific death rates in the standard population
+    conf.level = 0.95) # The confidence level for your confidence intervals
+}
+
+indirect.sir.us.all <- list()
+indirect.sir.us.1 <- list()
+indirect.sir.us.2 <- list()
+indirect.sir.us.3 <- list()
+indirect.sir.us.4 <- list()
+indirect.sir.us.5 <- list()
+indirect.sir.us.6 <- list()
+
+indirect.sir.us.all <- lapply(list.us2, function(x) ageadjust.func.us.all(x))
+indirect.sir.us.1 <- lapply(list.us2, function(x) ageadjust.func.us.1(x))
+indirect.sir.us.2 <- lapply(list.us2, function(x) ageadjust.func.us.2(x))
+indirect.sir.us.3 <- lapply(list.us2, function(x) ageadjust.func.us.3(x))
+indirect.sir.us.4 <- lapply(list.us2, function(x) ageadjust.func.us.4(x))
+indirect.sir.us.5 <- lapply(list.us2, function(x) ageadjust.func.us.5(x))
+indirect.sir.us.6 <- lapply(list.us2, function(x) ageadjust.func.us.6(x))
+
+#Calculate SIR
+#indirect.sir <- list()
+#for(i in 1:list){
+#  indirect.sir[i] <- ageadjust.indirect(
+#    df.sum %>% ungroup() %>% arrange(fips) %>% filter(country == "USA" & fips == list[i]) %>%     dplyr::select(deaths), 
+#    # The number of events observed in the population of interest
+#    df.census.age.county.long.f %>% arrange(fips) %>% filter(fips == list[i]) %>% dplyr::select(population), 
+#    # The population by age group in the population of interest
+#    df.cdc %>% dplyr::select(covid_19_deaths), # The number of events observed in the standard population
+#    df.cdc %>% dplyr::select(population), # The population by age group in the standard population
+#    df.cdc %>% dplyr::select(rate), # The age specific death rates in the standard population
+#    conf.level = 0.95) # The confidence level for your confidence intervals
+#}
+
+indirect.US <- function(indirect.sir.us, df.sum) {
+
+  #Extract each variable from list
+  indirect.sir.us.sir <- lapply(indirect.sir.us, "[", c(1))
+  indirect.sir.us.sir <- do.call(rbind, indirect.sir.us.sir)
+  indirect.sir.us.sir <- as.data.frame(do.call(rbind, indirect.sir.us.sir))
+  indirect.sir.us.sir <- cbind(indirect.sir.us.sir, as.data.frame(list.us2))
+  indirect.sir.us.sir <- indirect.sir.us.sir %>% dplyr::select(fips = list.us2, observed, exp, sir, lci,
+                                                               uci)
+  indirect.sir.us.rate <- lapply(indirect.sir.us, "[", c(2))
+  indirect.sir.us.rate <- do.call(rbind, indirect.sir.us.rate)
+  indirect.sir.us.rate <- as.data.frame(do.call(rbind, indirect.sir.us.rate))
+  indirect.sir.us.rate <- cbind(indirect.sir.us.rate, as.data.frame(list.us2))
+  indirect.sir.us.rate <- indirect.sir.us.rate %>% 
+    dplyr::select(fips = list.us2, crude.rate, adj.rate, lci.rate = lci, uci.rate = uci) %>%
+    mutate_at(vars(2:5), funs(.*100000))
+
+  df.sum.sir.us <- df.sum %>% filter(country == "USA") %>% left_join(indirect.sir.us.sir, by = "fips")
+  df.sum.sir.us <- df.sum.sir.us %>% filter(country == "USA") %>% left_join(indirect.sir.us.rate, by =
+                                                                              "fips")
+  
+  return(df.sum.sir.us)
+}
+
+df.sum.sir.us.all <- indirect.US(indirect.sir.us.all, df.sall)
+df.sum.sir.us.1 <- indirect.US(indirect.sir.us.1, df.s1)
+df.sum.sir.us.2 <- indirect.US(indirect.sir.us.2, df.s2)
+df.sum.sir.us.3 <- indirect.US(indirect.sir.us.3, df.s3)
+df.sum.sir.us.4 <- indirect.US(indirect.sir.us.4, df.s4)
+df.sum.sir.us.5 <- indirect.US(indirect.sir.us.5, df.s5)
+df.sum.sir.us.6 <- indirect.US(indirect.sir.us.6, df.s6)
+
+```
+```{r Indirect Standardization Mexico, include=FALSE}
+#Calculate SIR and age adjusted rates 
+#p_load(tidylog)
+
+#Create function to calculate SMR
+ageadjust.func.all <- function(x) {
+    ageadjust.indirect(
+    df.sall %>% ungroup() %>% arrange(fips) %>% 
+      filter(country == "Mexico" & fips == x) %>% dplyr::select(deaths), 
+    # The number of events observed in the population of interest
+    df.poblacion.municipio.long.f %>% arrange(fips) %>% filter(fips == x) %>% dplyr::select(population), 
+    # The population by age group in the population of interest
+    df.dgb.mx.all %>% dplyr::select(covid_19_deaths), # The number of events observed in the standard population
+    df.dgb.mx.all %>% dplyr::select(population), # The population by age group in the standard population
+    df.dgb.mx.all %>% dplyr::select(rate), # The age specific death rates in the standard population
+    conf.level = 0.95) # The confidence level for your confidence intervals
+}
+
+ageadjust.func.1 <- function(x) {
+    ageadjust.indirect(
+    df.s1 %>% ungroup() %>% arrange(fips) %>% 
+      filter(country == "Mexico" & fips == x) %>% dplyr::select(deaths), 
+    # The number of events observed in the population of interest
+    df.poblacion.municipio.long.f %>% arrange(fips) %>% filter(fips == x) %>% dplyr::select(population), 
+    # The population by age group in the population of interest
+    df.dgb.mx.1 %>% dplyr::select(covid_19_deaths), # The number of events observed in the standard population
+    df.dgb.mx.1 %>% dplyr::select(population), # The population by age group in the standard population
+    df.dgb.mx.1 %>% dplyr::select(rate), # The age specific death rates in the standard population
+    conf.level = 0.95) # The confidence level for your confidence intervals
+}
+
+ageadjust.func.2 <- function(x) {
+    ageadjust.indirect(
+    df.s2 %>% ungroup() %>% arrange(fips) %>% 
+      filter(country == "Mexico" & fips == x) %>% dplyr::select(deaths), 
+    # The number of events observed in the population of interest
+    df.poblacion.municipio.long.f %>% arrange(fips) %>% filter(fips == x) %>% dplyr::select(population), 
+    # The population by age group in the population of interest
+    df.dgb.mx.2 %>% dplyr::select(covid_19_deaths), # The number of events observed in the standard population
+    df.dgb.mx.2 %>% dplyr::select(population), # The population by age group in the standard population
+    df.dgb.mx.2 %>% dplyr::select(rate), # The age specific death rates in the standard population
+    conf.level = 0.95) # The confidence level for your confidence intervals
+}
+
+ageadjust.func.3 <- function(x) {
+    ageadjust.indirect(
+    df.s3 %>% ungroup() %>% arrange(fips) %>% 
+      filter(country == "Mexico" & fips == x) %>% dplyr::select(deaths), 
+    # The number of events observed in the population of interest
+    df.poblacion.municipio.long.f %>% arrange(fips) %>% filter(fips == x) %>% dplyr::select(population), 
+    # The population by age group in the population of interest
+    df.dgb.mx.3 %>% dplyr::select(covid_19_deaths), # The number of events observed in the standard population
+    df.dgb.mx.3 %>% dplyr::select(population), # The population by age group in the standard population
+    df.dgb.mx.3 %>% dplyr::select(rate), # The age specific death rates in the standard population
+    conf.level = 0.95) # The confidence level for your confidence intervals
+}
+
+ageadjust.func.4 <- function(x) {
+    ageadjust.indirect(
+    df.s4 %>% ungroup() %>% arrange(fips) %>% 
+      filter(country == "Mexico" & fips == x) %>% dplyr::select(deaths), 
+    # The number of events observed in the population of interest
+    df.poblacion.municipio.long.f %>% arrange(fips) %>% filter(fips == x) %>% dplyr::select(population), 
+    # The population by age group in the population of interest
+    df.dgb.mx.4 %>% dplyr::select(covid_19_deaths), # The number of events observed in the standard population
+    df.dgb.mx.4 %>% dplyr::select(population), # The population by age group in the standard population
+    df.dgb.mx.4 %>% dplyr::select(rate), # The age specific death rates in the standard population
+    conf.level = 0.95) # The confidence level for your confidence intervals
+}
+
+ageadjust.func.5 <- function(x) {
+    ageadjust.indirect(
+    df.s5 %>% ungroup() %>% arrange(fips) %>% 
+      filter(country == "Mexico" & fips == x) %>% dplyr::select(deaths), 
+    # The number of events observed in the population of interest
+    df.poblacion.municipio.long.f %>% arrange(fips) %>% filter(fips == x) %>% dplyr::select(population), 
+    # The population by age group in the population of interest
+    df.dgb.mx.5 %>% dplyr::select(covid_19_deaths), # The number of events observed in the standard population
+    df.dgb.mx.5 %>% dplyr::select(population), # The population by age group in the standard population
+    df.dgb.mx.5 %>% dplyr::select(rate), # The age specific death rates in the standard population
+    conf.level = 0.95) # The confidence level for your confidence intervals
+}
+
+ageadjust.func.6 <- function(x) {
+    ageadjust.indirect(
+    df.s6 %>% ungroup() %>% arrange(fips) %>% 
+      filter(country == "Mexico" & fips == x) %>% dplyr::select(deaths), 
+    # The number of events observed in the population of interest
+    df.poblacion.municipio.long.f %>% arrange(fips) %>% filter(fips == x) %>% dplyr::select(population), 
+    # The population by age group in the population of interest
+    df.dgb.mx.6 %>% dplyr::select(covid_19_deaths), # The number of events observed in the standard population
+    df.dgb.mx.6 %>% dplyr::select(population), # The population by age group in the standard population
+    df.dgb.mx.6 %>% dplyr::select(rate), # The age specific death rates in the standard population
+    conf.level = 0.95) # The confidence level for your confidence intervals
+}
+
+list.mx <- as.vector(unique(df.sall %>% ungroup() %>% filter(country == "Mexico" & !is.na(fips)) %>% dplyr::select(fips)))
+#list.mx <- as.vector(unique(df.poblacion.municipio.long %>% filter(!is.na(fips)) %>% dplyr::select(fips)))
+list.mx <- as.vector(list.mx$fips)
+df.poblacion.municipio.long.f <- df.poblacion.municipio.long %>% filter(fips %in% list.mx) %>% ungroup()
+
+# list.mx.1 <- as.vector(unique(df.poblacion.municipio.long.1 %>% filter(!is.na(fips)) %>% dplyr::select(fips)))
+# list.mx.1 <- as.vector(list.mx.1$fips)
+# df.poblacion.municipio.long.1.f <- df.poblacion.municipio.long.1 %>% filter(fips %in% list.mx.1) %>% ungroup()
+
+#Calculate SMR
+indirect.sir.mx.all <- list()
+indirect.sir.mx.1 <- list()
+indirect.sir.mx.2 <- list()
+indirect.sir.mx.3 <- list()
+indirect.sir.mx.4 <- list()
+indirect.sir.mx.5 <- list()
+indirect.sir.mx.6 <- list()
+
+  #for(i in 1:list.mx){
+  #  indirect.sir.mx[i] <- ageadjust.indirect(
+  #    df.sum %>% ungroup() %>% arrange(fips) %>% 
+  #      filter(country == "Mexico" & fips == list.mx[i]) %>% dplyr::select(deaths), 
+  #    # The number of events observed in the population of interest
+  #    df.poblacion.municipio.long.f %>% arrange(fips) %>% filter(fips == list.mx[i]) %>% dplyr::select(population), 
+  #    # The population by age group in the population of interest
+  #    df.dgb.mx %>% dplyr::select(covid_19_deaths), # The number of events observed in the standard population
+  #    df.dgb.mx %>% dplyr::select(population), # The population by age group in the standard population
+  #    df.dgb.mx %>% dplyr::select(rate), # The age specific death rates in the standard population
+  #    conf.level = 0.95) # The confidence level for your confidence intervals
+  #}
+
+indirect.sir.mx.all <- lapply(list.mx, function(x) ageadjust.func.all(x))
+indirect.sir.mx.1 <- lapply(list.mx, function(x) ageadjust.func.1(x))
+indirect.sir.mx.2 <- lapply(list.mx, function(x) ageadjust.func.2(x))
+indirect.sir.mx.3 <- lapply(list.mx, function(x) ageadjust.func.3(x))
+indirect.sir.mx.4 <- lapply(list.mx, function(x) ageadjust.func.4(x))
+indirect.sir.mx.5 <- lapply(list.mx, function(x) ageadjust.func.5(x))
+indirect.sir.mx.6 <- lapply(list.mx, function(x) ageadjust.func.6(x))
+
+indirect.MX <- function(df.sum, indirect.sir.mx) {
+
+
+  #Extract each variable from list
+  indirect.sir.mx.sir <- lapply(indirect.sir.mx, "[", c(1))
+  indirect.sir.mx.sir <- do.call(rbind, indirect.sir.mx.sir)
+  indirect.sir.mx.sir <- as.data.frame(do.call(rbind, indirect.sir.mx.sir))
+  indirect.sir.mx.sir <- cbind(indirect.sir.mx.sir, as.data.frame(list.mx))
+  indirect.sir.mx.sir <- indirect.sir.mx.sir %>% dplyr::select(fips = list.mx, observed, exp, sir, lci, uci)
+
+  indirect.sir.mx.rate <- lapply(indirect.sir.mx, "[", c(2))
+  indirect.sir.mx.rate <- do.call(rbind, indirect.sir.mx.rate)
+  indirect.sir.mx.rate <- as.data.frame(do.call(rbind, indirect.sir.mx.rate))
+  indirect.sir.mx.rate <- cbind(indirect.sir.mx.rate, as.data.frame(list.mx))
+  indirect.sir.mx.rate <- indirect.sir.mx.rate %>% 
+    dplyr::select(fips = list.mx, crude.rate, adj.rate, lci.rate = lci, uci.rate = uci) %>%
+    mutate_at(vars(2:5), funs(.*100000))
+  
+  df.sum.sir.mx <- df.sum %>% filter(country == "Mexico") %>% left_join(indirect.sir.mx.sir, by = "fips")
+  df.sum.sir.mx <- df.sum.sir.mx %>% filter(country == "Mexico") %>% left_join(indirect.sir.mx.rate, by = "fips")
+  
+  return(df.sum.sir.mx)
+}
+
+df.sum.sir.mx.all <- indirect.MX(df.sall, indirect.sir.mx.all)
+df.sum.sir.mx.1 <- indirect.MX(df.s1, indirect.sir.mx.1)
+df.sum.sir.mx.2 <- indirect.MX(df.s2, indirect.sir.mx.2)
+df.sum.sir.mx.3 <- indirect.MX(df.s3, indirect.sir.mx.3)
+df.sum.sir.mx.4 <- indirect.MX(df.s4, indirect.sir.mx.4)
+df.sum.sir.mx.5 <- indirect.MX(df.s5, indirect.sir.mx.5)
+df.sum.sir.mx.6 <- indirect.MX(df.s6, indirect.sir.mx.6)
+
+```
+```{r SMR data wrangle, include=FALSE}
+#Bind mexico and US dataframes
+df.sum.sir.all <- bind_rows(df.sum.sir.mx.all, df.sum.sir.us.all)
+df.sum.sir.1 <- bind_rows(df.sum.sir.mx.1, df.sum.sir.us.1)
+df.sum.sir.2 <- bind_rows(df.sum.sir.mx.2, df.sum.sir.us.2)
+df.sum.sir.3 <- bind_rows(df.sum.sir.mx.3, df.sum.sir.us.3)
+df.sum.sir.4 <- bind_rows(df.sum.sir.mx.4, df.sum.sir.us.4)
+df.sum.sir.5 <- bind_rows(df.sum.sir.mx.5, df.sum.sir.us.5)
+df.sum.sir.6 <- bind_rows(df.sum.sir.mx.6, df.sum.sir.us.6)
+
+fct_case_when <- function(...) {
+  args <- as.list(match.call())
+  levels <- sapply(args[-1], function(f) f[[3]])  # extract RHS of formula
+  levels <- levels[!is.na(levels)]
+  factor(dplyr::case_when(...), levels=levels)
+}
+
+SIR.numtext <- function(df.sum.sir) {
+  df.sum.sir <- df.sum.sir %>% 
+    mutate(sir.cat = fct_case_when(
+                             sir < 0.25 ~ "0 to 0.25",
+                             sir >= 0.25 & sir < 0.50 ~ "0.25 to 0.50",   
+                             sir >= 0.50 & sir < 0.75 ~ "0.50 to 0.75",
+                             sir >= 0.75 & sir < 1.00 ~ "0.75 to 1.00",
+                             sir >= 1.00 & sir < 1.25 ~ "1.00 to 1.25",
+                             sir >= 1.25 & sir < 1.50 ~ "1.25 to 1.50",
+                             sir >= 1.50 & sir < 1.75 ~ "1.50 to 1.75",
+                             sir >= 1.75 & sir < 2.00 ~ "1.75 to 2.00",
+                             #sir >= 2.00  ~ "2.00 or greater"))
+                             sir >= 2.00 & sir < 2.25 ~ "2.00 to 2.25",
+                             sir >= 2.25 & sir < 2.50 ~ "2.25 to 2.50",
+                             sir >= 2.50 & sir < 2.75 ~ "2.50 to 2.75",
+                             sir >= 2.75 & sir < 3.00 ~ "2.75 to 3.00",
+                             sir >= 3.00  ~ "3.00 or greater"))
+  
+}
+
+df.sum.sir.all <- SIR.numtext(df.sum.sir.all)
+df.sum.sir.1 <- SIR.numtext(df.sum.sir.1)
+df.sum.sir.2 <- SIR.numtext(df.sum.sir.2)
+df.sum.sir.3 <- SIR.numtext(df.sum.sir.3)
+df.sum.sir.4 <- SIR.numtext(df.sum.sir.4)
+df.sum.sir.5 <- SIR.numtext(df.sum.sir.5)
+df.sum.sir.6 <- SIR.numtext(df.sum.sir.6)
+
+#df.sum.sir$sir.cat <- factor(df.sum.sir$sir.cat, 
+#                             levels = c("Less than 0.25", "0.25 to 0.75", "0.75 to 1.25", "1.25 to 1.75",
+#                                        "1.75 to 2.25", "2.25 to 2.75", "2.75 to 3.25", "3.25 or greater"))
+#write.csv(df.sum.sir, "base211201.csv")
+                             
+```
+
+```{r Import USA data for HDI, include=FALSE}
+#Import ACS - Income
+#https://jamesgerber.sdsu.edu/docs/Human_development_on_border.pdf
+df.hdi <- get_acs(geography = "county",
+              variables = c(population = "B01003_001", income = "B19301_001", 
+                            hs.m.1 = "B15002_011", hs.m.2 = "B15002_012", hs.m.3 = "B15002_013", hs.m.4 = "B15002_014",
+                            hs.m.5 = "B15002_015", hs.m.6 = "B15002_016", hs.m.7 = "B15002_017", hs.m.8 = "B15002_018", 
+                            hs.f.1 = "B15002_028", hs.f.2 = "B15002_029", hs.f.3 = "B15002_030", hs.f.4 = "B15002_031", 
+                            hs.f.5 = "B15002_032", hs.f.6 = "B15002_033", hs.f.7 = "B15002_034", hs.f.8 = "B15002_035", 
+                            enrolled.total = "B14001_002", enrolled.prof = "B14001_009", enrolled.college = "B14001_008",
+                            m1 = "B01001_004", m2 = "B01001_005", m3 = "B01001_006", m4 =	"B01001_007", 
+                            f1 = "B01001_028", f2 = "B01001_029",	f3 = "B01001_030", f4 =	"B01001_031"),
+              #state = c("CA", "AZ", "NM", "TX"),
+              year = 2018)
+df.hdi <- df.hdi %>% dplyr::select(!moe) %>% spread(variable, estimate)
+df.hdi <- df.hdi %>% mutate(population.children = m1 + m2 + m3 + m4 + f1 + f2 + f3 + f4)
+df.hdi <- df.hdi %>% mutate(high.school = hs.m.1 + hs.m.2 + hs.m.3 + hs.m.4 + hs.m.5 + hs.m.6 + hs.m.7 + hs.m.8 +
+                              hs.f.1 + hs.f.2 + hs.f.3 + hs.f.4 + hs.f.5 + hs.f.6 + hs.f.7 + hs.f.8)
+df.hdi <- df.hdi %>% mutate(enrolled.children = enrolled.total - (enrolled.prof + enrolled.college))
+df.hdi <- df.hdi %>% mutate(enrollment.ratio = enrolled.children/population.children*100)
+df.hdi <- df.hdi %>% mutate(attainment.index = high.school/population*100)
+df.hdi <- df.hdi %>% mutate(educational.index = (0.67*attainment.index + 0.33*enrollment.ratio)/100)
+#(⅔)*(education attainment index) +(⅓)*(gross enrolment ratio) 
+
+#US Life Expectancy Data
+df.life <- read.csv("Data/U.S._Life_Expectancy_at_Birth_by_State_and_Census_Tract_-_2010-2015.csv")
+df.life <- df.life %>% 
+  group_by(County, State) %>% 
+  filter(!is.na(Life.Expectancy)) %>% 
+  summarise(Life.Expectancy = round(mean(Life.Expectancy),1)) %>%
+  filter(!County %in% "(blank)")
+df.life$County <- str_replace(df.life$County, pattern = "Dona Ana", replacement = "Doña Ana")
+df.life$County <- str_sub(df.life$County, end=-4)
+df.life$NAME <- paste(df.life$County, df.life$State)
+df.hdi <- df.hdi %>% left_join(df.life[,3:4], by = "NAME")
+```
+
+```{r Import Mexico data for HDI, include=FALSE}
+#Mexico life expectancy
+##https://www.redalyc.org/jatsRepo/312/31251073004/31251073004.pdf
+df.life.mx <- read.csv("Data/Life_expectancy_mexico_2010.csv")
+df.life.mx$municipio <- sprintf("%03d", df.life.mx$municipio)
+df.life.mx$fips <- paste0(df.life.mx$estado, df.life.mx$municipio)
+
+#Load IPUMS ##Takes a long time
+p_load(ipumsr)
+ddi.mx <- read_ipums_ddi("Data/IPUMS/ipumsi_00005.xml") #Need to get license and upload manually
+ipums.mx <- read_ipums_micro(ddi.mx)
+#ipums_view(ipums.mx)
+```
+
+```{r HDI US calculation, include = FALSE}
+#US HDI Calculation
+df.hdi <- df.hdi %>% mutate(LE.index = (Life.Expectancy - 20)/(85 - 20))
+df.hdi <- df.hdi %>% mutate(Income.index = ((log(income) - log(100))/(log(75000) - log(100))))
+df.hdi <- df.hdi %>% mutate(hdi = LE.index * Income.index * educational.index)
+df.hdi <- df.hdi %>% mutate(hdi = '^'(hdi,1/3))
+
+df.hdi$fips <- as.numeric(df.hdi$GEOID)
+df.sum.sir.us.all <- df.sum.sir.us.all %>% left_join(df.hdi[,c("fips","hdi")], by = "fips")
+```
+```{r HDI Mexico calculation, include = FALSE}
+#Income 
+df.hdi.mx.income <- ipums.mx %>%  filter(INCEARN < 99999998) %>% 
+  group_by(fips = GEO2_MX2015) %>% 
+  summarize(income.mean = round(weighted.mean(INCEARN, PERWT, na.rm = TRUE),0)) 
+df.hdi.mx.income$fips <- as.character(df.hdi.mx.income$fips)
+
+#Education - Mean years of school for age >25
+df.hdi.mx.educ <- ipums.mx %>% filter(AGE >24 | YRSCHOOL < 90 ) %>%
+  group_by(fips = GEO2_MX2015) %>%
+  summarize(school.years = round(weighted.mean(YRSCHOOL, PERWT, na.rm = TRUE),1))
+df.hdi.mx.educ$fips <- as.character(df.hdi.mx.educ$fips)
+
+#Merge all together
+df.hdi.mx <- df.hdi.mx.income %>% left_join(df.life.mx, by = "fips")
+df.hdi.mx <- df.hdi.mx %>% left_join(df.hdi.mx.educ, by = "fips")
+
+#Calculate HDI for Mexico
+df.hdi.mx <- df.hdi.mx %>% mutate(LE.index = (esperanza - 20)/(85 - 20))
+df.hdi.mx <- df.hdi.mx %>% mutate(Income.index = ((log(income.mean) - log(100))/(log(75000) - log(100))))
+df.hdi.mx <- df.hdi.mx %>% mutate(Educational.index = ((school.years/15) + (14.3/18))/2)
+df.hdi.mx <- df.hdi.mx %>% mutate(hdi = LE.index * Income.index * Educational.index)
+df.hdi.mx <- df.hdi.mx %>% mutate(hdi = '^'(hdi,1/3))
+df.hdi.mx$fips <- as.numeric(df.hdi.mx$fips)
+
+df.sum.sir.mx.all <- df.sum.sir.mx.all %>% left_join(df.hdi.mx[,c("fips","hdi")], by = "fips")
+```
+
+```{r Beds, include=FALSE}
+df.beds.us <- read.csv("Data/Beds_full.csv")
+df.beds.us$country <- "USA"
+
+#https://bateam.maps.arcgis.com/home/item.html?id=1044bb19da8d4dbfb6a96eb1b4ebf629&view=list&sortOrder=true&sortField=defaultFSOrder#data
+#Dictionary
+# of Licensed Beds NUM_LICENSED_BEDS
+# of Staffed Beds  NUM_STAFFED_BEDS
+# of ICU Beds NUM_ICU_BEDS 
+# of Adult ICU Beds ADULT_ICU_BEDS 
+# of Pediatric ICU Beds PEDI_ICU_BEDS 
+# Bed Utilization Rate BED_UTILIZATION 
+# Potential Increase in Bed Capacity Potential_Increase_In_Bed_Capac 
+# Average Ventilator Usage AVG_VENTILATOR_USAGE
+
+df.beds.us <- df.beds.us %>% group_by(FIPS) %>% summarise(beds = sum(NUM_LICENS), beds.icu =  sum(NUM_ICU_BE), beds.icu.adult = sum(ADULT_ICU_), country = first(country))
+df.beds.us <- df.beds.us %>% dplyr::select(fips = FIPS, beds, beds.icu, beds.icu.adult, country)
+ 
+#Import Mexican bed data
+df.beds.mx <- readxl::read_excel("Data/Camas Mex-EUA.xlsx", sheet = 3)
+df.beds.mx <- df.beds.mx %>% dplyr::select(fips = CVEGEO, beds = Camas) %>% mutate(country = "Mexico")
+df.beds.mx$fips <- as.numeric(df.beds.mx$fips)
+df.beds.mx$beds.icu <- NA
+df.beds.mx$beds.icu.adult <- NA
+
+#Bind df and merge to main df
+df.beds <- bind_rows(df.beds.us, df.beds.mx)
+
+bed_function <- function(x) {
+  x <- x %>% left_join(df.beds, by = c("fips", "country")) 
+
+  #Create beds per 10,000
+  x <- x %>% mutate(beds.rate = round(beds/population * 10000, 1))
+  x <- x %>% mutate(beds.icu.rate = round(beds.icu/population * 10000, 1))
+  x <- x %>% mutate(beds.cases = round(beds/cases, 1))
+  x <- x %>% 
+    mutate(north = ifelse(state %in% c("Baja California", "Baja California Sur", 
+                                     "Sonora", "Chihuahua", "Coahuila", "Nuevo Leon", 
+                                     "Tamaulipas"), "Yes", "No"))
+}
+
+df.sum.sir.all <- bed_function(df.sum.sir.all)
+df.sum.sir.1 <- bed_function(df.sum.sir.1)
+df.sum.sir.2 <- bed_function(df.sum.sir.2)
+df.sum.sir.3 <- bed_function(df.sum.sir.3)
+df.sum.sir.4 <- bed_function(df.sum.sir.4)
+df.sum.sir.5 <- bed_function(df.sum.sir.5)
+df.sum.sir.6 <- bed_function(df.sum.sir.6)
+
+time <- paste(Sys.Date())
+write.csv(df.sum.sir.all, paste0("Data/border_", time, ".csv"))
+```
+
+```{r Make table for border area, include=FALSE}
+
+border_table_function_old <- function(df.sall, df.sum.sir.all, df.dgb.mx.all, df.cdc.all) {
+
+  #Import beds
+  df.sall.bed <- df.sall %>% left_join(df.sum.sir.all %>% dplyr::select(fips, beds), by = "fips")
+  #df.sall <- df.sall %>% left_join(df.sum.sir.all %>% dplyr::select(fips), by = "fips")
+  df.sall.bed$beds <- replace_na(df.sall.bed$beds, 0)
+
+  #Make table comparing border vs non-border
+  df.table.border <- df.sall.bed %>% filter(south %in% c("Yes", NA) | north %in% c("Yes", NA))
+  df.table.border <- df.table.border %>% filter(!(north == "No" & south == "No"))
+  df.table.border2 <- df.table.border %>% 
+    filter(!county == "Unknown") %>%
+    group_by(country, border) %>% 
+    summarise(cases = sum(cases), deaths = sum(deaths), beds = sum(beds),
+            population = sum(population, na.rm = T),
+            case.rate = round((cases/population)*100000,1),
+            death.rate = round((deaths/population)*100000,1),
+            beds.rate = round((beds/population)*10000,1))
+
+  #Extract border age group populations to calculate SIR
+  list.mx.border <- as.vector(unique(df.table.border %>% 
+                                     filter(country == "Mexico") %>% dplyr::select(fips)))
+  list.mx.border <- as.vector(list.mx.border$fips) 
+  df.poblacion.border <- df.poblacion.municipio.long.f %>% filter(fips %in% list.mx.border)
+  df.poblacion.border <- df.poblacion.border %>% left_join(df.table.border[,-c(1,2,6)], by = "fips")
+  df.poblacion.border <- df.poblacion.border %>% group_by(border, age_group) %>% 
+    summarise(population = sum(population))
+
+  #Set up function
+  ageadjust.func <- function(x) {
+    ageadjust.indirect(
+    # The number of events observed in the population of interest
+      df.table.border2 %>% ungroup() %>% filter(country == "Mexico" & border == x) %>% 
+        dplyr::select(deaths), 
+      # The population by age group in the population of interest
+      df.poblacion.border %>% ungroup() %>% filter(border == x) %>% dplyr::select(population), 
+      # The number of events observed in the standard population
+      df.dgb.mx.all %>% dplyr::select(covid_19_deaths), 
+      # The population by age group in the standard population
+      df.dgb.mx.all %>% dplyr::select(population),
+      # The age specific death rates in the standard population
+      df.dgb.mx.all %>% dplyr::select(rate), 
+      # The confidence level for your confidence intervals
+      conf.level = 0.95) 
+  }
+
+  indirect.sir.mx.border.sir <- lapply(list("Yes", "No"), function(x) ageadjust.func(x))
+
+  #Extract each variable from list
+  indirect.sir.mx.border <- lapply(indirect.sir.mx.border.sir, "[", c(1))
+  indirect.sir.mx.border <- do.call(rbind, indirect.sir.mx.border)
+  indirect.sir.mx.border <- as.data.frame(do.call(rbind, indirect.sir.mx.border))
+  indirect.sir.mx.border <- cbind(indirect.sir.mx.border, border = c("Yes", "No"))
+  indirect.sir.mx.border <- indirect.sir.mx.border %>% dplyr::select(border, observed, exp, sir, lci, uci)
+
+  indirect.sir.mx.border.rate <- lapply(indirect.sir.mx.border.sir, "[", c(2))
+  indirect.sir.mx.border.rate <- do.call(rbind, indirect.sir.mx.border.rate)
+  indirect.sir.mx.border.rate <- as.data.frame(do.call(rbind, indirect.sir.mx.border.rate))
+  indirect.sir.mx.border.rate <- cbind(indirect.sir.mx.border.rate, border = c("Yes", "No"))
+  indirect.sir.mx.border.rate <- indirect.sir.mx.border.rate %>% 
+  dplyr::select(border, crude.rate, adj.rate, lci.rate = lci, uci.rate = uci) %>%
+  mutate_at(vars(2:5), funs(.*100000))
+
+  #Merge SIR and adjusted rates
+  df.table.border2.mx.sir <- df.table.border2 %>% filter(country == "Mexico") %>% 
+    left_join(indirect.sir.mx.border, by = "border")
+  df.table.border2.mx.sir <- df.table.border2.mx.sir %>% filter(country == "Mexico") %>% 
+    left_join(indirect.sir.mx.border.rate, by = "border")
+
+  #Do the same for US side 
+  list.us.border <- as.vector(unique(df.table.border %>% 
+                                     filter(country == "USA") %>% dplyr::select(fips)))
+  list.us.border <- as.vector(list.us.border$fips) 
+  df.population.border <- df.census.age.county.long.f %>% filter(fips %in% list.us.border)
+  df.population.border <- df.population.border %>% left_join(df.table.border[,-c(1,2,6)], by = "fips")
+  df.population.border <- df.population.border %>% group_by(border, age_group) %>% 
+    summarise(population = sum(population))
+
+  ageadjust.func <- function(x) {
+    ageadjust.indirect(
+    # The number of events observed in the population of interest
+      df.table.border2 %>% ungroup() %>% filter(country == "USA" & border == x) %>% 
+        dplyr::select(deaths), 
+      # The population by age group in the population of interest
+      df.population.border %>% ungroup() %>% filter(border == x) %>% dplyr::select(population), 
+      # The number of events observed in the standard population
+      df.cdc.all %>% dplyr::select(covid_19_deaths), 
+      # The population by age group in the standard population
+      df.cdc.all %>% dplyr::select(population),
+      # The age specific death rates in the standard population
+      df.cdc.all %>% dplyr::select(rate), 
+      # The confidence level for your confidence intervals
+      conf.level = 0.95) 
+  }
+
+  indirect.sir.us.border.sir <- lapply(list("Yes", "No"), function(x) ageadjust.func(x))
+
+  #Extract each variable from list
+  indirect.sir.us.border  <- lapply(indirect.sir.us.border.sir , "[", c(1))
+  indirect.sir.us.border  <- do.call(rbind, indirect.sir.us.border )
+  indirect.sir.us.border  <- as.data.frame(do.call(rbind, indirect.sir.us.border ))
+  indirect.sir.us.border  <- cbind(indirect.sir.us.border , border = c("Yes", "No"))
+  indirect.sir.us.border  <- indirect.sir.us.border  %>% dplyr::select(border, observed, exp, sir, lci, uci)
+
+  indirect.sir.us.border.rate <- lapply(indirect.sir.us.border.sir, "[", c(2))
+  indirect.sir.us.border.rate <- do.call(rbind, indirect.sir.us.border.rate)
+  indirect.sir.us.border.rate <- as.data.frame(do.call(rbind, indirect.sir.us.border.rate))
+  indirect.sir.us.border.rate <- cbind(indirect.sir.us.border.rate, border = c("Yes", "No"))
+  indirect.sir.us.border.rate <- indirect.sir.us.border.rate %>% 
+    dplyr::select(border, crude.rate, adj.rate, lci.rate = lci, uci.rate = uci) %>%
+  mutate_at(vars(2:5), funs(.*100000))
+
+  #Merge SIR and adjusted rates
+  df.table.border2.us.sir <- df.table.border2 %>% filter(country == "USA") %>% 
+    left_join(indirect.sir.us.border, by = "border")
+  df.table.border2.us.sir <- df.table.border2.us.sir %>% filter(country == "USA") %>% 
+    left_join(indirect.sir.us.border.rate, by = "border")
+
+  df.table.border2.sir <- bind_rows(df.table.border2.us.sir, df.table.border2.mx.sir)
+  
+  return(df.table.border2.sir)
+  
+}
+border_table_function <- function(df.sall, df.sum.sir.all, df.dgb.mx.all, df.cdc.all) {
+
+  #Import beds
+  #df.sall.bed <- df.sall %>% left_join(df.sum.sir.all %>% dplyr::select(fips, beds), by = "fips")
+  df.sall <- df.sall %>% left_join(df.sum.sir.all %>% dplyr::select(fips), by = "fips")
+  #df.sall.bed$beds <- replace_na(df.sall.bed$beds, 0)
+
+  #Make table comparing border vs non-border
+  df.table.border <- df.sall %>% filter(south %in% c("Yes", NA) | north %in% c("Yes", NA))
+  df.table.border <- df.table.border %>% filter(!(north == "No" & south == "No"))
+  df.table.border2 <- df.table.border %>% 
+    filter(!county == "Unknown") %>%
+    group_by(country, border) %>% 
+    summarise(cases = sum(cases), deaths = sum(deaths),
+            population = sum(population, na.rm = T),
+            case.rate = round((cases/population)*100000,1),
+            death.rate = round((deaths/population)*100000,1))
+
+  #Extract border age group populations to calculate SIR
+  list.mx.border <- as.vector(unique(df.table.border %>% 
+                                     filter(country == "Mexico") %>% dplyr::select(fips)))
+  list.mx.border <- as.vector(list.mx.border$fips) 
+  df.poblacion.border <- df.poblacion.municipio.long.f %>% filter(fips %in% list.mx.border)
+  df.poblacion.border <- df.poblacion.border %>% left_join(df.table.border[,-c(1,2,6)], by = "fips")
+  df.poblacion.border <- df.poblacion.border %>% group_by(border, age_group) %>% 
+    summarise(population = sum(population))
+
+  #Set up function
+  ageadjust.func <- function(x) {
+    ageadjust.indirect(
+    # The number of events observed in the population of interest
+      df.table.border2 %>% ungroup() %>% filter(country == "Mexico" & border == x) %>% 
+        dplyr::select(deaths), 
+      # The population by age group in the population of interest
+      df.poblacion.border %>% ungroup() %>% filter(border == x) %>% dplyr::select(population), 
+      # The number of events observed in the standard population
+      df.dgb.mx.all %>% dplyr::select(covid_19_deaths), 
+      # The population by age group in the standard population
+      df.dgb.mx.all %>% dplyr::select(population),
+      # The age specific death rates in the standard population
+      df.dgb.mx.all %>% dplyr::select(rate), 
+      # The confidence level for your confidence intervals
+      conf.level = 0.95) 
+  }
+
+  indirect.sir.mx.border.sir <- lapply(list("Yes", "No"), function(x) ageadjust.func(x))
+
+  #Extract each variable from list
+  indirect.sir.mx.border <- lapply(indirect.sir.mx.border.sir, "[", c(1))
+  indirect.sir.mx.border <- do.call(rbind, indirect.sir.mx.border)
+  indirect.sir.mx.border <- as.data.frame(do.call(rbind, indirect.sir.mx.border))
+  indirect.sir.mx.border <- cbind(indirect.sir.mx.border, border = c("Yes", "No"))
+  indirect.sir.mx.border <- indirect.sir.mx.border %>% dplyr::select(border, observed, exp, sir, lci, uci)
+
+  indirect.sir.mx.border.rate <- lapply(indirect.sir.mx.border.sir, "[", c(2))
+  indirect.sir.mx.border.rate <- do.call(rbind, indirect.sir.mx.border.rate)
+  indirect.sir.mx.border.rate <- as.data.frame(do.call(rbind, indirect.sir.mx.border.rate))
+  indirect.sir.mx.border.rate <- cbind(indirect.sir.mx.border.rate, border = c("Yes", "No"))
+  indirect.sir.mx.border.rate <- indirect.sir.mx.border.rate %>% 
+  dplyr::select(border, crude.rate, adj.rate, lci.rate = lci, uci.rate = uci) %>%
+  mutate_at(vars(2:5), funs(.*100000))
+
+  #Merge SIR and adjusted rates
+  df.table.border2.mx.sir <- df.table.border2 %>% filter(country == "Mexico") %>% 
+    left_join(indirect.sir.mx.border, by = "border")
+  df.table.border2.mx.sir <- df.table.border2.mx.sir %>% filter(country == "Mexico") %>% 
+    left_join(indirect.sir.mx.border.rate, by = "border")
+
+  #Do the same for US side 
+  list.us.border <- as.vector(unique(df.table.border %>% 
+                                     filter(country == "USA") %>% dplyr::select(fips)))
+  list.us.border <- as.vector(list.us.border$fips) 
+  df.population.border <- df.census.age.county.long.f %>% filter(fips %in% list.us.border)
+  df.population.border <- df.population.border %>% left_join(df.table.border[,-c(1,2,6)], by = "fips")
+  df.population.border <- df.population.border %>% group_by(border, age_group) %>% 
+    summarise(population = sum(population))
+
+  ageadjust.func <- function(x) {
+    ageadjust.indirect(
+    # The number of events observed in the population of interest
+      df.table.border2 %>% ungroup() %>% filter(country == "USA" & border == x) %>% 
+        dplyr::select(deaths), 
+      # The population by age group in the population of interest
+      df.population.border %>% ungroup() %>% filter(border == x) %>% dplyr::select(population), 
+      # The number of events observed in the standard population
+      df.cdc.all %>% dplyr::select(covid_19_deaths), 
+      # The population by age group in the standard population
+      df.cdc.all %>% dplyr::select(population),
+      # The age specific death rates in the standard population
+      df.cdc.all %>% dplyr::select(rate), 
+      # The confidence level for your confidence intervals
+      conf.level = 0.95) 
+  }
+
+  indirect.sir.us.border.sir <- lapply(list("Yes", "No"), function(x) ageadjust.func(x))
+
+  #Extract each variable from list
+  indirect.sir.us.border  <- lapply(indirect.sir.us.border.sir , "[", c(1))
+  indirect.sir.us.border  <- do.call(rbind, indirect.sir.us.border )
+  indirect.sir.us.border  <- as.data.frame(do.call(rbind, indirect.sir.us.border ))
+  indirect.sir.us.border  <- cbind(indirect.sir.us.border , border = c("Yes", "No"))
+  indirect.sir.us.border  <- indirect.sir.us.border  %>% dplyr::select(border, observed, exp, sir, lci, uci)
+
+  indirect.sir.us.border.rate <- lapply(indirect.sir.us.border.sir, "[", c(2))
+  indirect.sir.us.border.rate <- do.call(rbind, indirect.sir.us.border.rate)
+  indirect.sir.us.border.rate <- as.data.frame(do.call(rbind, indirect.sir.us.border.rate))
+  indirect.sir.us.border.rate <- cbind(indirect.sir.us.border.rate, border = c("Yes", "No"))
+  indirect.sir.us.border.rate <- indirect.sir.us.border.rate %>% 
+    dplyr::select(border, crude.rate, adj.rate, lci.rate = lci, uci.rate = uci) %>%
+  mutate_at(vars(2:5), funs(.*100000))
+
+  #Merge SIR and adjusted rates
+  df.table.border2.us.sir <- df.table.border2 %>% filter(country == "USA") %>% 
+    left_join(indirect.sir.us.border, by = "border")
+  df.table.border2.us.sir <- df.table.border2.us.sir %>% filter(country == "USA") %>% 
+    left_join(indirect.sir.us.border.rate, by = "border")
+
+  df.table.border2.sir <- bind_rows(df.table.border2.us.sir, df.table.border2.mx.sir)
+  
+  return(df.table.border2.sir)
+  
+}
+
+df.table.border2.sir.all <- border_table_function(df.sall, df.sum.sir.all, df.dgb.mx.all, df.cdc.all)
+df.table.border2.sir.1 <- border_table_function(df.s1, df.sum.sir.1, df.dgb.mx.1, df.cdc.1)
+df.table.border2.sir.2 <- border_table_function(df.s2, df.sum.sir.2, df.dgb.mx.2, df.cdc.2)
+df.table.border2.sir.3 <- border_table_function(df.s3, df.sum.sir.3, df.dgb.mx.3, df.cdc.3)
+df.table.border2.sir.4 <- border_table_function(df.s4, df.sum.sir.4, df.dgb.mx.4, df.cdc.4)
+df.table.border2.sir.5 <- border_table_function(df.s5, df.sum.sir.5, df.dgb.mx.5, df.cdc.5)
+df.table.border2.sir.6 <- border_table_function(df.s6, df.sum.sir.6, df.dgb.mx.6, df.cdc.6)
+
+```
+
+```{r Import US data for maps, include=FALSE}
+#Get US-Mexico international border
+US.mex.border <- st_read(
+  "Maps/Mexico_and_US_Border/Mexico_and_US_Border.shp")
+US.mex.border <- smoothr::densify(US.mex.border, n = 10)
+US.mex.border <- fortify(US.mex.border)
+
+#Import counting mapping
+counties_sf <- get_urbn_map("counties", sf = T)
+#counties_sf <- counties_sf %>% filter(state_abbv %in% c("CA", "AZ", "NM", "TX"))
+counties_sf$fips <- as.numeric(counties_sf$county_fips) #Take away leading zero to match NYT
+
+counties_sf.all <- counties_sf %>% left_join(df.sum.sir.all %>% filter(country == "USA"), by = "fips")
+counties_sf.all <- counties_sf.all %>% 
+  mutate(border = ifelse(fips %in% border.us.fips, "Yes", "No"))
+
+counties_sf.1 <- counties_sf %>% left_join(df.sum.sir.1 %>% filter(country == "USA"), by = "fips")
+counties_sf.1 <- counties_sf.1 %>% 
+  mutate(border = ifelse(fips %in% border.us.fips, "Yes", "No"))
+
+counties_sf.2 <- counties_sf %>% left_join(df.sum.sir.2 %>% filter(country == "USA"), by = "fips")
+counties_sf.2 <- counties_sf.2 %>% 
+  mutate(border = ifelse(fips %in% border.us.fips, "Yes", "No"))
+
+counties_sf.3 <- counties_sf %>% left_join(df.sum.sir.3 %>% filter(country == "USA"), by = "fips")
+counties_sf.3 <- counties_sf.3 %>% 
+  mutate(border = ifelse(fips %in% border.us.fips, "Yes", "No"))
+
+counties_sf.4 <- counties_sf %>% left_join(df.sum.sir.4 %>% filter(country == "USA"), by = "fips")
+counties_sf.4 <- counties_sf.4 %>% 
+  mutate(border = ifelse(fips %in% border.us.fips, "Yes", "No"))
+
+counties_sf.5 <- counties_sf %>% left_join(df.sum.sir.5 %>% filter(country == "USA"), by = "fips")
+counties_sf.5 <- counties_sf.5 %>% 
+  mutate(border = ifelse(fips %in% border.us.fips, "Yes", "No"))
+
+counties_sf.6 <- counties_sf %>% left_join(df.sum.sir.6 %>% filter(country == "USA"), by = "fips")
+counties_sf.6 <- counties_sf.6 %>% 
+  mutate(border = ifelse(fips %in% border.us.fips, "Yes", "No"))
+
+# counties_sf.all <- SIR.numtext(counties_sf.all)
+# counties_sf.1 <- SIR.numtext(counties_sf.1)
+# counties_sf.2 <- SIR.numtext(counties_sf.2)
+# counties_sf.3 <- SIR.numtext(counties_sf.3)
+# counties_sf.4 <- SIR.numtext(counties_sf.4)
+# counties_sf.5 <- SIR.numtext(counties_sf.5)
+# counties_sf.6 <- SIR.numtext(counties_sf.6)
+
+#Import state mapping
+states_sf <- get_urbn_map("states", sf = T)
+states_sf <- states_sf %>%
+  mutate(south = case_when(state_abbv %in% c("CA", "AZ", "NM", "TX") ~ "Yes",
+                           TRUE ~ "No"))
+# states_sf <- states_sf %>% filter(!state_abbv %in% c("AK", "HI")) %>%
+#   mutate(south = case_when(state_abbv %in% c("CA", "AZ", "NM", "TX") ~ "Yes",
+#                            TRUE ~ "No"))
+```
+```{r Import Mexico data for map, include=FALSE}
+#Import Mexico Municipal Map
+#https://www.prestevez.com/es/tutorial/tutorial-mapas-con-R-y-tidyverse/
+map.mx <- st_read("Maps/01_32_mun/01_32_mun.shp")
+map.mx$fips <- as.numeric(as.character(map.mx$CVEGEO))
+
+map.mx.all <- map.mx %>% 
+  left_join(df.sum.sir.all %>% filter(country == "Mexico"), by = "fips")
+map.mx.all <- map.mx.all %>% 
+  mutate(border = ifelse(fips %in% border.mx.fips, "Yes", "No"))
+map.mx.all <- map.mx.all  %>% 
+  mutate(north = ifelse(CVE_ENT %in% c("02", "03", "05", "08", "19", "26", "28"), "Yes", "No"))
+
+map.mx.1 <- map.mx %>% 
+  left_join(df.sum.sir.1 %>% filter(country == "Mexico"), by = "fips")
+map.mx.1 <- map.mx.1 %>% 
+  mutate(border = ifelse(fips %in% border.mx.fips, "Yes", "No"))
+map.mx.1 <- map.mx.1  %>% 
+  mutate(north = ifelse(CVE_ENT %in% c("02", "03", "05", "08", "19", "26", "28"), "Yes", "No"))
+
+map.mx.2 <- map.mx %>% 
+  left_join(df.sum.sir.2 %>% filter(country == "Mexico"), by = "fips")
+map.mx.2 <- map.mx.2 %>% 
+  mutate(border = ifelse(fips %in% border.mx.fips, "Yes", "No"))
+map.mx.2 <- map.mx.2  %>% 
+  mutate(north = ifelse(CVE_ENT %in% c("02", "03", "05", "08", "19", "26", "28"), "Yes", "No"))
+
+map.mx.3 <- map.mx %>% 
+  left_join(df.sum.sir.3 %>% filter(country == "Mexico"), by = "fips")
+map.mx.3 <- map.mx.3 %>% 
+  mutate(border = ifelse(fips %in% border.mx.fips, "Yes", "No"))
+map.mx.3 <- map.mx.3  %>% 
+  mutate(north = ifelse(CVE_ENT %in% c("02", "03", "05", "08", "19", "26", "28"), "Yes", "No"))
+
+map.mx.4 <- map.mx %>% 
+  left_join(df.sum.sir.4 %>% filter(country == "Mexico"), by = "fips")
+map.mx.4 <- map.mx.4 %>% 
+  mutate(border = ifelse(fips %in% border.mx.fips, "Yes", "No"))
+map.mx.4 <- map.mx.4  %>% 
+  mutate(north = ifelse(CVE_ENT %in% c("02", "03", "05", "08", "19", "26", "28"), "Yes", "No"))
+
+map.mx.5 <- map.mx %>% 
+  left_join(df.sum.sir.5 %>% filter(country == "Mexico"), by = "fips")
+map.mx.5 <- map.mx.5 %>% 
+  mutate(border = ifelse(fips %in% border.mx.fips, "Yes", "No"))
+map.mx.5 <- map.mx.5  %>% 
+  mutate(north = ifelse(CVE_ENT %in% c("02", "03", "05", "08", "19", "26", "28"), "Yes", "No"))
+
+map.mx.6 <- map.mx %>% 
+  left_join(df.sum.sir.6 %>% filter(country == "Mexico"), by = "fips")
+map.mx.6 <- map.mx.6 %>% 
+  mutate(border = ifelse(fips %in% border.mx.fips, "Yes", "No"))
+map.mx.6 <- map.mx.6  %>% 
+  mutate(north = ifelse(CVE_ENT %in% c("02", "03", "05", "08", "19", "26", "28"), "Yes", "No"))
+
+#Import Mexico State Map
+map.mx.state <- st_read("Maps/dest_2015gw/dest_2015gw.shp")
+map.mx.state <- map.mx.state  %>% 
+  mutate(north = ifelse(CVE_ENT %in% c("02", "03", "05", "08", "19", "26", "28"), "Yes", "No"))
+
+```
+
+```{r Import US vaccination data, include=FALSE}
+df.cdc.vacc <- jsonlite::fromJSON("https://data.cdc.gov/resource/8xkx-amqh.json?$limit=99999999")
+df.cdc.vacc.US <- filter(df.cdc.vacc, date == "2021-11-30T00:00:00.000")
+colnames(df.cdc.vacc.US)[2] <- "county_fips"
+df.cdc.vacc.US <- merge(df.cdc.vacc.US, counties_sf[, c("county_fips", "state_fips", "geometry")], by = "county_fips")
+df.cdc.vacc.US <- unique(df.cdc.vacc.US)
+```
+
+```{r US vaccination data formatting, include=FALSE}
+#df.cvu.comp <- df.cdc.vacc.US
+
+df.cdc.vacc.US$series_complete_pop_pct <- as.numeric(df.cdc.vacc.US$series_complete_pop_pct)
+
+df.cdc.vacc.US.map <- df.cdc.vacc.US %>% 
+  mutate(series_complete_pop_pct = fct_case_when(
+    series_complete_pop_pct > 0 & series_complete_pop_pct < 10 ~ "Less than 10%",
+    series_complete_pop_pct >= 10 & series_complete_pop_pct < 20 ~ "10 to 20%",   
+    series_complete_pop_pct >= 20 & series_complete_pop_pct < 30 ~ "20 to 30%",
+    series_complete_pop_pct >= 30 & series_complete_pop_pct < 40 ~ "30 to 40%",
+    series_complete_pop_pct >= 40 & series_complete_pop_pct < 50 ~ "40 to 50%",
+    series_complete_pop_pct >= 50 & series_complete_pop_pct < 60 ~ "50 to 60%",
+    series_complete_pop_pct >= 60 & series_complete_pop_pct < 70 ~ "60 to 70%",
+    series_complete_pop_pct >= 70 & series_complete_pop_pct < 80 ~ "70 to 80",
+    series_complete_pop_pct >= 80 & series_complete_pop_pct < 90 ~ "80 to 90%",
+    series_complete_pop_pct >= 90  ~ "90% or greater"))
+```
+
+```{r Import Mexico vaccination data, include=FALSE}
+library(readr)
+library(plyr)
+myfiles = list.files(path="Data/data_mx_vacc", pattern="*.csv", full.names=TRUE)
+dat_csv = ldply(myfiles, read_csv)
+dat_csv$descarga <- dat_csv$descarga %>% substring(1, 11)
+dat_csv$descarga <- dat_csv$descarga %>%
+str_replace_all(c("Jan" = "01",
+                  "Feb" = "02",
+                  "Mar" = "03",
+                  "Apr" = "04",
+                  "May" = "05",
+                  "Jun" = "06",
+                  "Jul" = "07",
+                  "Aug" = "08",
+                  "Sep" = "09",
+                  "Oct" = "10",
+                  "Nov" = "11",
+                  "Dec" = "12")) %>% dmy()
+
+df.mx.vacc <- dat_csv
+df.mx.vacc <- df.mx.vacc %>% filter(descarga <= "2021-11-30")
+df.mx.vacc$vacunados[is.na(df.mx.vacc$vacunados)] <- 0
+df.mx.vacc$vacunados <- as.numeric(df.mx.vacc$vacunados)
+
+df.mx.vacc.wide <- dcast(df.mx.vacc, Estado ~ descarga, value.var = "vacunados")
+
+```
+
+```{r Mexico vaccination data formatting, include=FALSE}
+
+map.mx.state.1 <- map.mx.state %>% mutate(state = case_when(
+  NOM_ENT == "Distrito Federal" ~ "CDMX",                          
+  NOM_ENT == "Coahuila de Zaragoza" ~ "Coahuila",
+  NOM_ENT == "Veracruz de Ignacio de la Llave" ~ "Veracruz",
+  NOM_ENT == "Michoacán de Ocampo" ~ "Michoacán",
+  NOM_ENT == "México" ~ "Estado de México",
+  TRUE ~ NOM_ENT))
+
+#mms.list <- as.data.frame(map.mx.state.1$state)
+#dmvm.list <- as.data.frame(df.mx.vacc.current$state)
+
+mp_states <- mp_states %>% mutate(state = case_when(
+  state == "Ciudad de México" ~ "CDMX",                          
+  state == "Coahuila de Zaragoza" ~ "Coahuila",
+  state == "Veracruz de Ignacio de la Llave" ~ "Veracruz",
+  state == "Michoacán de Ocampo" ~ "Michoacán",
+  state == "México" ~ "Estado de México",
+  TRUE ~ state))
+
+mp_states <- mp_states %>% mutate_all(funs(str_replace(., ",", "")))
+mp_states <- mp_states %>% mutate_all(funs(str_replace(., ",", "")))
+
+#Trending vaccination
+df.mx.vacc.wide <- df.mx.vacc.wide %>% mutate(Estado = case_when(
+  Estado == "Ciudad de México" ~ "CDMX",                          
+  Estado == "Coahuila de Zaragoza" ~ "Coahuila",
+  Estado == "Veracruz de Ignacio de la Llave" ~ "Veracruz",
+  Estado == "Michoacán de Ocampo" ~ "Michoacán",
+  Estado == "México" ~ "Estado de México",
+  TRUE ~ Estado))
+
+colnames(df.mx.vacc.wide)[1] <- "state"
+df.mx.vacc.wide <- df.mx.vacc.wide  %>% left_join(mp_states[,1:3], by = "state")
+df.mx.vacc.wide$total <- as.numeric(df.mx.vacc.wide$total)
+df.mx.vacc.wide[,2:103] <- df.mx.vacc.wide[,2:103]/df.mx.vacc.wide[,105]
+df.mx.vacc.current <- df.mx.vacc.wide %>% select("state", "2021-11-30", "total")
+map.mx.state.1 <- map.mx.state.1 %>% select(geometry, state)
+
+colnames(df.mx.vacc.current) <- c("state", "ratio", "total")
+df.mx.vacc.map <- map.mx.state.1 %>% left_join(df.mx.vacc.current, by = "state")
+
+```
+
+## Figures
+```{r Plot - Dyad death rate heatmap}
+df_dyads <- df.all %>% filter(!is.na(county2))
+
+df_dyads <- df_dyads %>% 
+  mutate(rate.cases.avg = ifelse(country == "Mexico", rate.cases.avg*2, rate.cases.avg))
+
+order <- c("San Diego", "Tijuana", "Imperial", "Mexicali", "Yuma", "San Luis Rio Colorado",
+           "El Paso", "Juarez", "Webb", "Nuevo Laredo", "Cameron", "Matamoros")
+df_dyads$county <- factor(df_dyads$county, levels = order)
+
+#p <-ggplot(df_dyads %>% filter(date >= "2020-03-01" & date <= "2021-05-31"), aes(date,county,fill=rate.cases.avg)) +
+p_dyad <-ggplot(df_dyads %>% filter(date >= "2020-04-01" & date <= "2021-12-01"
+                         & !is.na(county2) & rate.deaths.avg >= 0),
+                         aes(date,county,fill=rate.deaths.avg)) +  
+  geom_tile(color= "white",size=0.01) +
+  scale_fill_distiller(name = "7-day \n Average \n Death Rate", palette = "Spectral") +
+  labs(x = "Date", y = "County/Municipality") +
+  #scale_fill_continuous_diverging(palette = "Berlin", rev = FALSE, na.value = "white") +
+  scale_x_date(date_breaks = "90 day", 
+               date_labels = "%b\n%Y") +
+  facet_wrap(~ dyad, nrow = 6, dir = "h", scales = "free_y", drop = TRUE) +
+  theme_minimal() +
+  theme(
+    strip.background = element_blank(),
+    strip.text.x = element_blank()
+  ) +
+  theme(axis.text.y=element_text(angle=45,hjust=1))
+
+p_dyad
+
+ggsave("Plots/dyads.png")
+
+
+```
+
+```{r Plot - US Map SMR, eval=FALSE, include=FALSE}
+pop <- 100000
+indicator <- "sir.cat"
+lab <- "SMR" #"COVID-19\nmortality rate\nper 100,000"
+
+#Plot map for US
+p.us <-
+  #ggplot(data = counties_sf %>% filter(population > pop)) +
+  ggplot(data = counties_sf.all) +
+  geom_sf(mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf, color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  #geom_sf_label_repel(data = counties_sf %>% 
+  #                      filter(fips %in% c("6073", "6025", "4027", "48141", "48061", "48479")), 
+  #                    aes(label = county), fill='dark green', colour="white", segment.color = "black",
+  #                      nudge_x = 20000, nudge_y = -250000, seed = 5, vjust = 1) +
+  theme_void()
+p.us
+
+#Plot map for US border states
+p.us.south <-
+  ggplot(data = counties_sf.all %>% filter(population > pop & south == "Yes")) +
+  #ggplot(data = counties_sf %>% filter(south == "Yes")) +
+  geom_sf(mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf %>% filter(south == "Yes"), 
+          color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F) +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  geom_sf_label_repel(data = counties_sf.all %>% 
+                        filter(fips %in% c("6073", "6025", "4027", "48141", "48061", "48479")), 
+                      aes(label = county), fill='dark green', colour="white", segment.color = "black",
+                        nudge_x = 20000, nudge_y = -250000, seed = 5, vjust = 1) +
+  theme_void()
+p.us.south
+
+
+#Plot map for border counties only
+ggplot(data = counties_sf.all %>% filter(border == "Yes")) +
+  geom_sf(mapping = aes(fill = get(indicator)), color = "black", size = 0.05) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F) +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  geom_sf_label_repel(aes(label = county), fill='dark green', colour="white", segment.color = "black",
+                        nudge_x = 20000, nudge_y = 250000, seed = 5, vjust = 1) +
+  theme_void()
+
+#Plot map for border counties only with pop >100,000
+ggplot(data = counties_sf.all %>% filter(border == "Yes" & population >pop)) +
+  geom_sf(mapping = aes(fill = death.rate.pop), color = "black", size = 0.05) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_continuous_sequential(palette = "Lajolla", rev = F) +
+  labs(fill = "COVID-19\nmortality rate\nper 100,000") +
+  coord_sf(datum = NA) +
+  geom_sf_label_repel(aes(label = county), fill='dark green', colour="white", segment.color = "black",
+                        nudge_x = 20000, nudge_y = 250000, seed = 5, vjust = 1) +
+  theme_void()
+```
+
+```{r Plot - Mexico map SMR, eval=FALSE, include=FALSE}
+pop <- 99000
+indicator <- "sir.cat" #or sir  #or death.rate.pop
+lab <-  "Standardized Mortality Rate" #"COVID-19\nmortality rate\nper 100,000"
+
+
+#Plot map for mexican
+ggplot(data = map.mx.all %>% filter(population > pop)) +
+  geom_sf(color = "light grey", size = 0.1) +
+  geom_sf(data = map.mx.state, color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  #geom_sf(data = states_sf, color = "black", fill = "transparent", size = 0.2) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F) +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  geom_sf_label_repel(data = map.mx.all %>% 
+                        filter(fips %in% c("2004", "2002", "26055", "8037", "28027", "28022")),
+                  aes(label = county), 
+                  nudge_x = 20000, nudge_y = 500000, seed = 5) +
+  theme_void()
+
+#Plot map for mexican border states
+ggplot(data = map.mx.all %>% filter(north == "Yes" & population > pop)) +
+  geom_sf(color = "light grey", size = 0.1) +
+  geom_sf(data = map.mx.state %>% filter(north == "Yes"), color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  #geom_sf(data = states_sf, color = "black", fill = "transparent", size = 0.2) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F) +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  geom_sf_label_repel(data = map.mx.all %>% 
+                        filter(fips %in% c("2004", "2002", "26055", "8037", "28027", "28022")),
+                  aes(label = county), 
+                  nudge_x = 20000, nudge_y = -500000, seed = 5) +
+  theme_void()
+
+```
+
+```{r Plot - Binational SMR Maps at Country level, eval=FALSE, include=FALSE}
+pop <- 100000
+indicator <- "sir.cat" #"sir"  #or death.rate.pop
+lab <-  "Standardized Mortality Rate" #"COVID-19\nmortality rate\nper 100,000"
+
+#Both mexican and US counties
+ggplot() +
+  #geom_sf(data = counties_sf.all %>% filter(south == "Yes" & population > pop),
+  geom_sf(data = counties_sf.all %>% filter(!state %in% c("Alaska", "Hawaii")),
+  #geom_sf(data = counties_sf.all %>% filter(population > pop),
+  #geom_sf(data = counties_sf.all %>% filter(south == "Yes"),
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  #geom_sf(data = states_sf %>% filter(south == "Yes"), color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = states_sf, color = "black", fill = "transparent", size = 0.2) +
+  #geom_sf(data = map.mx.all %>% filter(north == "Yes" & population > pop), 
+  geom_sf(data = map.mx.all,
+  #geom_sf(data = map.mx %>% filter(population > pop), 
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1, na.rm = T) +
+  geom_sf(data = map.mx.state, color = "black", fill = "transparent", size = 0.2)+
+  #geom_sf(data = map.mx.state, color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  #geom_sf_label_repel(data = map.mx %>% 
+  #                      filter(fips %in% c("2004", "2002", "26055", "8037", "28027", "28022")),
+  #                aes(label = county2), 
+  #                nudge_x = 20000, nudge_y = -800000, seed = 5) +
+  #geom_sf_label_repel(data = counties_sf.all %>% 
+  #                      filter(fips %in% c("6073", "6025", "4027", "48141", "48061", "48479")), 
+  #                    aes(label = county2), fill='dark green', colour="white", segment.color = "black",
+  #                      nudge_x = 20000, nudge_y = 800000, seed = 5, vjust = 1) +
+  theme_void()
+
+```
+
+```{r Plot - Binational SMR Maps at State level, eval=FALSE, include=FALSE}
+pop <- 100000
+indicator <- "sir.cat" #"sir"  #or death.rate.pop
+lab <-  "Standardized Mortality Rate" #"COVID-19\nmortality rate\nper 100,000"
+
+#Both mexican and US counties
+ggplot() +
+  geom_sf(data = counties_sf.all %>% filter(population > pop & south == "Yes"), 
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf %>% filter(south == "Yes"), color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = map.mx.all %>% filter(north == "Yes" & population > pop), 
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1, na.rm = T) +
+  geom_sf(data = map.mx.state %>% filter(north == "Yes"), color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  #geom_sf_label_repel(data = map.mx %>% 
+  #                      filter(fips %in% c("2004", "2002", "26055", "8037", "28027", "28022")),
+  #                aes(label = county2), 
+  #                nudge_x = 20000, nudge_y = -800000, seed = 5) +
+  #geom_sf_label_repel(data = counties_sf.all %>% 
+  #                      filter(fips %in% c("6073", "6025", "4027", "48141", "48061", "48479")), 
+  #                    aes(label = county2), fill='dark green', colour="white", segment.color = "black",
+  #                      nudge_x = 20000, nudge_y = 800000, seed = 5, vjust = 1) +
+  theme_void()
+
+```
+```{r Plot - Binational SMR Maps border Municipality Only, eval=FALSE, include=FALSE}
+pop <- 100000
+indicator <- "sir.cat" #"sir"  #or death.rate.pop
+lab <-  "Standardized Mortality Rate" #"COVID-19\nmortality rate\nper 100,000"
+
+
+#Both mexican and US counties - border only
+ggplot() +
+  #geom_sf(data = counties_sf.all,
+  geom_sf(data = counties_sf.all %>% filter(population > pop & border == "Yes"),
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf, color = "black", fill = "transparent", size = 0.2) +
+  #geom_sf(data = map.mx,
+  geom_sf(data = map.mx.all %>% filter(population > pop & border == "Yes"), 
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1, na.rm = T) +
+  geom_sf(data = map.mx.state, color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+ # geom_sf_label_repel(data = map.mx %>% 
+ #                       filter(fips %in% c("2004", "2002", "26055", "8037", "28027", "28022")),
+#                  aes(label = county2), 
+#                  nudge_x = 2, nudge_y = -800, seed = 5) +
+#  geom_sf_label_repel(data = counties_sf.all %>% 
+#                        filter(fips %in% c("6073", "6025", "4027", "48141", "48061", "48479")), 
+#                      aes(label = county2), fill='dark green', colour="white", segment.color = "black",
+#                        nudge_x = 2, nudge_y = 800, seed = 5, vjust = 1) +
+#  coord_sf(crs = st_crs("+proj=longlat +ellps=WGS84"), 
+#           xlim = c(-119, -94), ylim = c(23, 38), expand = FALSE) +
+  theme_void()
+```
+
+```{r Plot - Binational SMR Maps by Season at Country level, eval=FALSE, include=FALSE}
+pop <- 100000
+indicator <- "sir.cat" #"sir"  #or death.rate.pop
+lab <-  "Standardized Mortality Rate" #"COVID-19\nmortality rate\nper 100,000"
+
+#Both mexican and US counties
+
+#ggsave(spring2021, "Plots/filename.png", height = 8, width = 10, dpi = 600)
+
+early2020 <- ggplot() +
+  geom_sf(data = counties_sf.1 %>% filter(!state %in% c("Alaska", "Hawaii")),
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf %>% filter(!state_name %in% c("Alaska", "Hawaii")), color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = map.mx.1, 
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.05, na.rm = T) +
+  geom_sf(data = map.mx.state, color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  ylab("SMR before 6/1/2020") +
+  theme_void()
+
+ggsave("Plots/early2020.png", dpi = 300, height = 8, width = 10)
+
+early2020_AH <- ggplot() +
+  geom_sf(data = counties_sf.1,
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf, color = "black", fill = "transparent", size = 0.2) +
+  # geom_sf(data = map.mx.1, 
+  #         mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1, na.rm = T) +
+  # geom_sf(data = map.mx.state, color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  ylab("SMR before 6/1/2020") +
+  theme_void()
+ 
+ggsave("Plots/early2020_AH.png", dpi = 300, height = 8, width = 10)
+ 
+summer2020 <- ggplot() +
+  geom_sf(data = counties_sf.2 %>% filter(!state %in% c("Alaska", "Hawaii")),
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf %>% filter(!state_name %in% c("Alaska", "Hawaii")), color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = map.mx.2, 
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.05, na.rm = T) +
+  geom_sf(data = map.mx.state, color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  ylab("SMR between 6/1/2020 and 9/1/2020") +
+  theme_void()
+
+ggsave("Plots/summer2020.png", dpi = 300, height = 8, width = 10)
+
+summer2020_AH <- ggplot() +
+  geom_sf(data = counties_sf.2,
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf, color = "black", fill = "transparent", size = 0.2) +
+  # geom_sf(data = map.mx.2, 
+  #         mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1, na.rm = T) +
+  # geom_sf(data = map.mx.state, color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  ylab("SMR between 6/1/2020 and 9/1/2020") +
+  theme_void()
+
+ggsave("Plots/summer2020_AH.png", dpi = 300, height = 8, width = 10)
+
+fall2020 <- ggplot() +
+  geom_sf(data = counties_sf.3 %>% filter(!state %in% c("Alaska", "Hawaii")),
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.05) +
+  geom_sf(data = states_sf %>% filter(!state_name %in% c("Alaska", "Hawaii")), color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = map.mx.3, 
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1, na.rm = T) +
+  geom_sf(data = map.mx.state, color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  ylab("SMR between 9/1/2020 and 12/1/2020") +
+  theme_void()
+
+ggsave("Plots/fall2020.png", dpi = 300, height = 8, width = 10)
+
+fall2020_AH <- ggplot() +
+  geom_sf(data = counties_sf.3,
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf, color = "black", fill = "transparent", size = 0.2) +
+  # geom_sf(data = map.mx.3, 
+  #         mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1, na.rm = T) +
+  # geom_sf(data = map.mx.state, color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  ylab("SMR between 9/1/2020 and 12/1/2020") +
+  theme_void()
+
+ggsave("Plots/fall2020_AH.png", dpi = 300, height = 8, width = 10)
+
+winter2020 <- ggplot() +
+  geom_sf(data = counties_sf.4 %>% filter(!state %in% c("Alaska", "Hawaii")),
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf %>% filter(!state_name %in% c("Alaska", "Hawaii")), color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = map.mx.4, 
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.05, na.rm = T) +
+  geom_sf(data = map.mx.state, color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  ylab("SMR between 12/1/2020 and 2/1/2021") +
+  theme_void()
+
+ggsave("Plots/winter2020.png", dpi = 300, height = 8, width = 10)
+
+winter2020_AH <- ggplot() +
+  geom_sf(data = counties_sf.4,
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf, color = "black", fill = "transparent", size = 0.2) +
+  # geom_sf(data = map.mx.4, 
+  #         mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1, na.rm = T) +
+  # geom_sf(data = map.mx.state, color = "black", fill = "transparent", size = 0.2) +
+   geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  ylab("SMR between 12/1/2020 and 2/1/2021") +
+  theme_void()
+
+ggsave("Plots/winter2020_AH.png", dpi = 300, height = 8, width = 10)
+
+spring2021 <- ggplot() +
+  geom_sf(data = counties_sf.5 %>% filter(!state %in% c("Alaska", "Hawaii")),
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf %>% filter(!state_name %in% c("Alaska", "Hawaii")), color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = map.mx.5, 
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.05, na.rm = T) +
+  geom_sf(data = map.mx.state, color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  ylab("SMR between 2/1/2021 and 6/1/2021") +
+  theme_void()
+
+ggsave("Plots/spring2021.png", dpi = 300, height = 8, width = 10)
+
+spring2021_AH <- ggplot() +
+  geom_sf(data = counties_sf.5,
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf, color = "black", fill = "transparent", size = 0.2) +
+  # geom_sf(data = map.mx.5, 
+  #         mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1, na.rm = T) +
+  # geom_sf(data = map.mx.state, color = "black", fill = "transparent", size = 0.2) +
+  # geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  ylab("SMR between 2/1/2021 and 6/1/2021") +
+  theme_void()
+
+ggsave("Plots/spring2021_AH.png", dpi = 300, height = 8, width = 10)
+
+delta2021 <- ggplot() +
+  geom_sf(data = counties_sf.6 %>% filter(!state %in% c("Alaska", "Hawaii")),
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf %>% filter(!state_name %in% c("Alaska", "Hawaii")), color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = map.mx.6, 
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.05, na.rm = T) +
+  geom_sf(data = map.mx.state, color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  ylab("SMR between 6/1/2021 and 12/1/2021") +
+  theme_void()
+
+ggsave("Plots/delta2021.png", dpi = 300, height = 8, width = 10)
+
+delta2021_AH <- ggplot() +
+  geom_sf(data = counties_sf.6,
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf, color = "black", fill = "transparent", size = 0.2) +
+  # geom_sf(data = map.mx.6, 
+  #         mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  # geom_sf(data = map.mx.state, color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  ylab("SMR between 6/1/2021 and 12/1/2021") +
+  theme_void()
+
+ggsave("Plots/delta2021_AH.png", dpi = 300, height = 8, width = 10)
+
+allpan <- ggplot() +
+  geom_sf(data = counties_sf.all %>% filter(!state %in% c("Alaska", "Hawaii")),
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf %>% filter(!state_name %in% c("Alaska", "Hawaii")), color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = map.mx.all, 
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.05) +
+  geom_sf(data = map.mx.state, color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  theme_void()
+
+ggsave("Plots/allpan.png", dpi = 300, height = 8, width = 10)
+
+allpan_AH <- ggplot() +
+  geom_sf(data = counties_sf.all,
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf, color = "black", fill = "transparent", size = 0.2) +
+  # geom_sf(data = map.mx.all, 
+  #         mapping = aes(fill = get(indicator)), color = "light grey", size = 0.05, na.rm = T) +
+  # geom_sf(data = map.mx.state, color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  theme_void()
+
+ggsave("Plots/allpan_AH.png", dpi = 300, height = 8, width = 10)
+
+require(gridExtra)
+#seasonal_maps <- grid.arrange(early2020, summer2020, fall2020, winter2020, spring2021, delta2021, ncol=2, nrow=3)
+
+
+
+```
+
+```{r Plot - Binational SMR Maps Border Zoom, eval=FALSE, include=FALSE}
+pop <- 100000
+indicator <- "sir.cat" #"sir"  #or death.rate.pop
+lab <-  "Standardized Mortality Rate" #"COVID-19\nmortality rate\nper 100,000"
+
+#Both mexican and US counties
+
+#ggsave(spring2021, "Plots/filename.png", height = 8, width = 10, dpi = 600)
+
+allpan_border <- ggplot() +
+  geom_sf(data = counties_sf.all %>% filter(south == "Yes"),
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf %>% filter(south == "Yes"), color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = map.mx.all %>% filter(north == "Yes"), 
+          mapping = aes(fill = get(indicator)), color = "light grey", size = 0.05) +
+  geom_sf(data = map.mx.state %>% filter(north == "Yes"), color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Lajolla", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  theme_void()
+
+require(gridExtra)
+#seasonal_maps <- grid.arrange(early2020, summer2020, fall2020, winter2020, spring2021, delta2021, ncol=2, nrow=3)
+
+ggsave("Plots/allpan_border.png", dpi = 300, height = 8, width = 10)
+
+```
+
+```{r Plot - US HDI vs SMR}
+#Border Plot
+ggplot(df.sum.sir.us.all %>% filter(border == "Yes"), aes(x = sir, y = hdi)) +
+  geom_vline(xintercept = 1, color = "red", alpha = 0.5, linetype = "dashed") +
+  geom_point(aes(size = population, color = state)) +
+  geom_smooth(method = "lm", linetype = "dashed") +
+  geom_text_repel(aes(label = county)) +
+  scale_x_continuous(breaks = c(0, 1, 2, 3, 4, 5, 6)) +
+  labs(x = "Standardized Mortality Ratio", y = "Human Development Index") +
+  theme_minimal() + fit.tidy 
+
+summary(lm(data = df.sum.sir.us.all %>% filter(border == "Yes"), formula = hdi ~ sir))
+broom::tidy(cor.test(df.sum.sir.us.all$hdi, df.sum.sir.us.all$sir))
+
+
+#National plot
+ggplot(df.sum.sir.us.all %>% filter(population > 499999), aes(x = sir, y = hdi)) +
+  geom_vline(xintercept = 1, color = "red", alpha = 0.5, linetype = "dashed") +
+  geom_point(aes(size = population), alpha = 0.1) +
+  geom_smooth(method = "lm", linetype = "dashed") +
+  scale_x_continuous(breaks = c(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)) +
+  labs(x = "Standardized Mortality Ratio", y = "Human Development Index") +
+  theme_minimal() + fit.tidy 
+```
+
+```{r Plot - US HDI vs SMR reverse}
+#Border Plot
+ggplot(df.sum.sir.us.all %>% filter(border == "Yes"), aes(y = sir, x = hdi)) +
+  geom_hline(yintercept = 1, color = "red", alpha = 0.5, linetype = "dashed") +
+  geom_point(aes(size = population, color = state)) +
+  geom_smooth(method = "lm", linetype = "dashed") +
+  geom_text_repel(aes(label = county)) +
+  #scale_y_continuous(breaks = c(0, 1, 2, 3, 4, 5, 6)) +
+  labs(y = "Standardized Mortality Ratio", x = "Human Development Index") +
+  theme_minimal() + fit.tidy
+
+summary(lm(data = df.sum.sir.us.all %>% filter(border == "Yes"), formula = hdi ~ sir))
+broom::tidy(cor.test(df.sum.sir.us.all$hdi, df.sum.sir.us.all$sir))
+
+ggsave("Plots/border_US_HDI.png", dpi = 300, height = 8, width = 10)
+
+#National plot
+ggplot(df.sum.sir.us.all %>% filter(population > 499999), aes(y = sir, x = hdi)) +
+  geom_hline(yintercept = 1, color = "red", alpha = 0.5, linetype = "dashed") +
+  geom_point(aes(size = population), alpha = 0.1) +
+  geom_smooth(method = "lm", linetype = "dashed") +
+  #scale_y_continuous(breaks = c(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)) +
+  labs(y = "Standardized Mortality Ratio", x = "Human Development Index") +
+  theme_minimal() + fit.tidy
+
+ggsave("Plots/national_US_HDI.png", , dpi = 300, height = 8, width = 10)
+
+```
+
+```{r Plot - Mexico HDI vs SMR}
+#Border Plot
+ggplot(df.sum.sir.mx.all %>% filter(border == "Yes"), aes(x = sir, y = hdi)) +
+  geom_vline(xintercept = 1, color = "red", alpha = 0.5, linetype = "dashed") +
+  geom_point(aes(size = population, color = state)) +
+  geom_smooth(method = "lm", linetype = "dashed") +
+  geom_text_repel(aes(label = county)) +
+  scale_x_continuous(breaks = c(0, 1, 2, 3, 4, 5, 6)) +
+  labs(x = "Standardized Mortality Ratio", y = "Human Development Index") +
+  theme_minimal() + fit.tidy2
+
+#National plot
+ggplot(df.sum.sir.mx.all %>% filter(population >499999), aes(x = sir, y = hdi)) +
+  geom_vline(xintercept = 1, color = "red", alpha = 0.5, linetype = "dashed") +
+  geom_point(aes(size = population), alpha = 0.1) +
+  geom_smooth(method = "lm", linetype = "dashed") +
+  #geom_point(data = df.sum.sir.mx %>% filter(border == "Yes"), aes(x = sir, y = hdi, fill = state), inherit.aes = F) +
+  scale_x_continuous(breaks = c(0, 1, 2), limits = c(0, 2)) +
+  labs(x = "Standardized Mortality Ratio", y = "Human Development Index") +
+  theme_minimal() + fit.tidy 
+```
+```{r Plot - Mexico HDI vs SMR reverse}
+#Border Plot
+ggplot(df.sum.sir.mx.all %>% filter(border == "Yes"), aes(y = sir, x = hdi)) +
+  geom_hline(yintercept = 1, color = "red", alpha = 0.5, linetype = "dashed") +
+  geom_point(aes(size = population, color = state)) +
+  geom_smooth(method = "lm", linetype = "dashed") +
+  geom_text_repel(aes(label = county)) +
+  scale_y_continuous(breaks = c(0, 1, 2, 3, 4, 5, 6)) +
+  labs(y = "Standardized Mortality Ratio", x = "Human Development Index") +
+  theme_minimal() + fit.tidy2
+
+ggsave("Plots/border_MX_HDI.png", dpi = 300, height = 8, width = 10)
+
+#National plot
+ggplot(df.sum.sir.mx.all %>% filter(population >499999), aes(y = sir, x = hdi)) +
+  geom_hline(yintercept = 1, color = "red", alpha = 0.5, linetype = "dashed") +
+  geom_point(aes(size = population), alpha = 0.1) +
+  geom_smooth(method = "lm", linetype = "dashed") +
+  #geom_point(data = df.sum.sir.mx %>% filter(border == "Yes"), aes(x = sir, y = hdi, fill = state), inherit.aes = F) +
+  scale_y_continuous(breaks = c(0, 1, 2), limits = c(0, 2)) +
+  labs(y = "Standardized Mortality Ratio", x = "Human Development Index") +
+  theme_minimal() + fit.tidy 
+
+ggsave("Plots/national_MX_HDI.png", dpi = 300, height = 8, width = 10)
+
+```
+
+```{r Table - SMR Border comparison EP, echo=FALSE}
+#For word
+
+flextable_border_create <- function(df.table.border2.sir) {
+
+df.table.border2.sir[,10:16] <- df.table.border2.sir[,10:16] %>% round(2)
+#c("sir", "lci", "uci", "crude.rate", "adj.rate", "lci.rate", "uci.rate")
+
+ft <- flextable(df.table.border2.sir,
+          col_keys = c("country", "border", "cases", "deaths", "population",
+                             "case.rate", "death.rate", 
+                             "adj.rate", "lci.rate", "uci.rate", 
+                             "sir", "lci", "uci")) %>%
+  set_header_labels(country = "Country", border = "Border Area", cases = "Cases", 
+                            deaths = "Deaths", population = "Population", 
+                            case.rate = "Crude Case Rate per 100,000", 
+                            death.rate = "Crude Death Rate per 100,000", 
+                            adj.rate = "Age-Adjusted Death Rate", 
+                            lci.rate = "Lower", uci.rate = "Upper",
+                            sir = "Standardized Mortality Ratio", lci = "Lower", uci = "Upper") %>%
+  set_caption(caption =  "Table. Comparison of COVID-19 rates by country and border proximity") %>%
+  footnote(i = 1, j = 2, value = as_paragraph(
+              c("Only includes counties within states that are on the border")),
+            ref_symbols = c("a"), part = "header") %>%
+  add_header_row(values = c("", "", "", "", "", "", "",
+                              "", "95% Confidence interval", "", 
+                              "", "95% Confidence interval", "")) %>%
+  merge_at(i = 1, j = c(9:10), part = "header") %>%
+  merge_at(i = 1, j = c(12:13), part = "header") %>%
+  merge_v(j = c("country")) %>%
+  colformat_num(j = 1:5, big.mark = ",", digits = 0) %>%
+  colformat_num(j = 6:13, big.mark = ",", digits = 1) %>%
+  colformat_num(j = 11:13, big.mark = ",", digits = 2) %>%
+  autofit() %>% theme_zebra(odd_header = "transparent", even_header = "transparent") %>%
+  align(align = "center", part = "all") %>%
+  align(align = "left", part = "footer") %>%
+  align_nottext_col(align = "center") %>%
+  hline_top(part = "header", border = officer::fp_border()) %>%
+  hline_bottom(part = "all", border = officer::fp_border())
+
+return(ft)
+
+}
+
+ft.all <- flextable_border_create(df.table.border2.sir.all)
+ft.1 <- flextable_border_create(df.table.border2.sir.1)
+ft.2 <- flextable_border_create(df.table.border2.sir.2)
+ft.3 <- flextable_border_create(df.table.border2.sir.3)
+ft.4 <- flextable_border_create(df.table.border2.sir.4)
+ft.5 <- flextable_border_create(df.table.border2.sir.5)
+ft.6 <- flextable_border_create(df.table.border2.sir.6)
+
+df.table.season <- df.table.border2.sir.all
+df.table.season[,3] <- df.table.border2.sir.1[,10]
+df.table.season[,4] <- df.table.border2.sir.2[,10]
+df.table.season[,5] <- df.table.border2.sir.3[,10]
+df.table.season[,6] <- df.table.border2.sir.4[,10]
+df.table.season[,7] <- df.table.border2.sir.5[,10]
+df.table.season[,8] <- df.table.border2.sir.6[,10]
+df.table.season[,9] <- df.table.border2.sir.all[,10]
+df.table.season <- df.table.season[,1:9]
+colnames(df.table.season) <- c("country", "border", "early20", "summer20",
+                               "fall20", "winter20", "spring21", "delta21", "allpan")
+
+
+df.table.season[,3:9] <- df.table.season[,3:9] %>% round(2)
+#c("sir", "lci", "uci", "crude.rate", "adj.rate", "lci.rate", "uci.rate")
+
+ft.season <- flextable(df.table.season,
+          col_keys = c("country", "border", "early20", "summer20", "fall20",
+                             "winter20", "spring21", 
+                             "delta21", "allpan")) %>%
+  set_header_labels(country = "Country", border = "Border Area",
+                            early20 = "Before 6/1/20", 
+                            summer20 = "6/1/20-9/1/20",
+                            fall20 = "9/1/20-12/1/20", 
+                            winter20 = "12/1/20-2/1/21", 
+                            spring21 = "2/1/21-6/1/21", 
+                            delta21 = "6/1/21-12/1/21", 
+                            allpan = "All Dates") %>%
+  set_caption(caption =  "Table. Comparison of COVID-19 SMR by country and border proximity throughout the pandemic") %>%
+  footnote(i = 1, j = 2, value = as_paragraph(
+              c("Only includes counties within states that are on the border")),
+            ref_symbols = c("a"), part = "header") %>%
+  merge_v(j = c("country")) %>%
+  autofit() %>% theme_zebra(odd_header = "transparent", even_header = "transparent") %>%
+  bg(i = c(1,3), j = 9, "darkslategray3", part = "body", source = j) %>%
+  bg(i = c(2,4), j = 9, "darkslategray2", part = "body", source = j) %>%
+  bg(i = NULL, j = 9, "darkslategray1", part = "header", source = j) %>%
+  align(align = "center", part = "all") %>%
+  align(align = "left", part = "footer") %>%
+  align_nottext_col(align = "center") %>%
+  hline_top(part = "header", border = officer::fp_border()) %>%
+  hline_bottom(part = "all", border = officer::fp_border())
+
+ft.season
+
+save_as_pptx("ft.all" = ft.all, path = "Tables/ft.all.pptx")
+save_as_pptx("ft.season" = ft.season, path = "Tables/ft.season.pptx")
+
+```
+```{r Table - SMR Counties, echo=FALSE}
+#Make table comparing border municipalities
+df.table.municipal.sir <- df.sum.sir.all %>% filter(!is.na(county2)) %>%
+  dplyr::select(country, county, 
+         case.rate, death.rate.pop,
+        sir, lci, uci, adj.rate, lci.rate, uci.rate)
+df.table.municipal.sir$county <- factor(df.table.municipal.sir$county, 
+                                         levels = c("San Diego", "Tijuana", 
+                                                  "Imperial", "Mexicali",
+                                                  "Yuma", "San Luis Rio Colorado",
+                                                  "El Paso", "Juarez",
+                                                  "Webb", "Nuevo Laredo",
+                                                  "Cameron", "Matamoros"))
+df.table.municipal.sir <- df.table.municipal.sir %>% arrange(county)
+
+#Table for word
+ft.2 <- flextable(df.table.municipal.sir,
+col_keys = c("country", "county", "adj.rate", "lci.rate", "uci.rate",
+                             "sir", "lci", "uci")) %>%
+  set_header_labels(country = "Country", county = "County/Municipality", 
+                            adj.rate = "Age-Adjusted Death Rate", 
+                            lci.rate = "Lower", uci.rate = "Upper",
+                            sir = "Standardized Mortality Ratio", lci = "Lower", uci = "Upper") %>%
+  add_header_row(values = c("", "", "", 
+                              "95% Confidence interval", "", 
+                              "", "95% Confidence interval", "")) %>%
+  set_caption(caption =  "Table . Comparison of COVID-19 rates by border county/municipality") %>%
+  colformat_num(j = 3, big.mark = ",", digits = 1) %>%
+  colformat_num(j = 4, big.mark = ",", digits = 1) %>%
+  colformat_num(j = 5, big.mark = ",", digits = 1) %>%
+  colformat_num(j = 6, big.mark = ",", digits = 2) %>%
+  colformat_num(j = 7, big.mark = ",", digits = 2) %>%
+  colformat_num(j = 8, big.mark = ",", digits = 2) %>%
+  autofit() %>% theme_zebra(odd_header = "transparent", even_header = "transparent") %>%
+  align(align = "center", part = "all") %>%
+  align(align = "left", part = "footer") %>%
+  align_nottext_col(align = "center") %>%
+  hline_top(part = "header", border = officer::fp_border()) %>%
+  hline_bottom(part = "all", border = officer::fp_border())
+ft.2 
+
+#print(ft.2, preview = "docx")
+```
+
+```{r Plot - US HDI vs vaccination}
+#Border Plot
+colnames(df.cdc.vacc.US)[1] <- "fips"
+df.cdc.vacc.US$fips <- as.numeric(df.cdc.vacc.US$fips)
+df.sum.sir.vacc.us <- merge(df.cdc.vacc.US, df.sum.sir.us.all, by = "fips")
+
+df.sum.sir.vacc.us$series_complete_pop_pct <- as.numeric(df.sum.sir.vacc.us$series_complete_pop_pct)
+
+ggplot(df.sum.sir.vacc.us %>% filter(border == "Yes"), aes(x = series_complete_pop_pct, y = hdi)) +
+  geom_vline(xintercept = 1, color = "red", alpha = 0.5, linetype = "dashed") +
+  geom_point(aes(size = population, color = state)) +
+  geom_smooth(method = "lm", linetype = "dashed") +
+  geom_text_repel(aes(label = county)) +
+  scale_x_continuous(breaks = c(0, 20, 40, 60, 80, 100)) +
+  labs(x = "Percent Population Fully Vaccinated", y = "Human Development Index") +
+  theme_minimal() + fit.tidy 
+
+summary(lm(data = df.sum.sir.vacc.us %>% filter(border == "Yes"), formula = hdi ~ series_complete_pop_pct))
+broom::tidy(cor.test(df.sum.sir.us.all$hdi, df.sum.sir.us.all$sir))
+
+
+#National plot
+ggplot(df.sum.sir.vacc.us %>% filter(population > 499999), aes(x = series_complete_pop_pct, y = hdi)) +
+  geom_vline(xintercept = 1, color = "red", alpha = 0.5, linetype = "dashed") +
+  geom_point(aes(size = population), alpha = 0.1) +
+  geom_smooth(method = "lm", linetype = "dashed") +
+  scale_x_continuous(breaks = c(0, 20, 40, 60, 80, 100)) +
+  labs(x = "Percent Population Full Vaccinated", y = "Human Development Index") +
+  theme_minimal() + fit.tidy 
+```
+```{r Plot - US HDI vs vaccination reverse}
+#Border Plot
+colnames(df.cdc.vacc.US)[1] <- "fips"
+df.cdc.vacc.US$fips <- as.numeric(df.cdc.vacc.US$fips)
+df.sum.sir.vacc.us <- merge(df.cdc.vacc.US, df.sum.sir.us.all, by = "fips")
+
+df.sum.sir.vacc.us$series_complete_pop_pct <- as.numeric(df.sum.sir.vacc.us$series_complete_pop_pct)
+
+ggplot(df.sum.sir.vacc.us %>% filter(border == "Yes"), aes(y = series_complete_pop_pct, x = hdi)) +
+  #geom_vline(yintercept = 1, color = "red", alpha = 0.5, linetype = "dashed") +
+  geom_point(aes(size = population, color = state)) +
+  geom_smooth(method = "lm", linetype = "dashed") +
+  geom_text_repel(aes(label = county)) +
+  scale_y_continuous(breaks = c(0, 20, 40, 60, 80, 100)) +
+  labs(y = "Percent Population Fully Vaccinated", x = "Human Development Index") +
+  theme_minimal() + fit.tidy 
+
+summary(lm(data = df.sum.sir.vacc.us %>% filter(border == "Yes"), formula = hdi ~ series_complete_pop_pct))
+broom::tidy(cor.test(df.sum.sir.us.all$hdi, df.sum.sir.us.all$sir))
+
+ggsave("Plots/border_US_vacc.png", dpi = 300, height = 8, width = 10)
+
+#National plot
+ggplot(df.sum.sir.vacc.us %>% filter(population > 499999), aes(y = series_complete_pop_pct, x = hdi)) +
+  #geom_vline(yintercept = 1, color = "red", alpha = 0.5, linetype = "dashed") +
+  geom_point(aes(size = population), alpha = 0.1) +
+  geom_smooth(method = "lm", linetype = "dashed") +
+  scale_y_continuous(breaks = c(0, 20, 40, 60, 80, 100)) +
+  labs(y = "Percent Population Full Vaccinated", x = "Human Development Index") +
+  theme_minimal() + fit.tidy
+
+ggsave("Plots/national_US_vacc.png", dpi = 300, height = 8, width = 10)
+
+```
+
+```{r Plot - US Map vaccination rates}
+#Get US-Mexico international border
+US.mex.border <- st_read(
+  "Maps/Mexico_and_US_Border/Mexico_and_US_Border.shp")
+US.mex.border <- smoothr::densify(US.mex.border, n = 10)
+US.mex.border <- fortify(US.mex.border)
+
+#Import counting mapping
+counties_sf2 <- get_urbn_map("counties", sf = T)
+#counties_sf <- counties_sf %>% filter(state_abbv %in% c("CA", "AZ", "NM", "TX"))
+counties_sf2 <- counties_sf2 %>% left_join(df.cdc.vacc.US.map, by = "county_fips")
+#counties_sf2 <- counties_sf2 %>% 
+  #mutate(border = ifelse(county_fips %in% border.us.fips, "Yes", "No"))
+
+#Import state mapping
+states_sf <- get_urbn_map("states", sf = T)
+states_sf <- states_sf %>%
+  mutate(south = case_when(state_abbv %in% c("CA", "AZ", "NM", "TX") ~ "Yes",
+                           TRUE ~ "No"))
+
+pop <- 100000
+indicator <- "series_complete_pop_pct"
+lab <- "Complete Vaccination Series" #"percentage of county population that has received both doses"
+
+#p.us <- ggplot(data = counties_sf2 %>% filter(population > pop)) +
+#p.us <- ggplot(data = counties_sf2 %>% filter(state_abbv %in% c("CA", "AZ", "NM", "TX"))) +
+p.us <- ggplot(data = counties_sf2) +
+  geom_sf(mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  geom_sf(data = states_sf, color = "black", fill = "transparent", size = 0.2) +
+  #geom_sf(data = states_sf %>% filter(south == "Yes"), 
+         # color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Plasma", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  #geom_sf_label_repel(data = counties_sf2 %>% 
+                        #filter(county_fips %in% c("6073", "6025", "4027", "48141", "48061", "48479")), 
+                      #aes(label = recip_county), fill='dark green', colour="white", segment.color = "black",
+                      #nudge_x = 20000, nudge_y = -250000, seed = 5, vjust = 1) +
+  theme_void()
+p.us
+
+ggsave("Plots/vacc.us.png", dpi = 300, height = 8, width = 10)
+
+#p.us <- ggplot(data = counties_sf2 %>% filter(population > pop)) +
+p.us.1 <- ggplot(data = counties_sf2 %>% filter(state_abbv %in% c("CA", "AZ", "NM", "TX"))) +
+#p.us <- ggplot(data = counties_sf2) +
+  geom_sf(mapping = aes(fill = get(indicator)), color = "light grey", size = 0.1) +
+  #geom_sf(data = states_sf, color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = states_sf %>% filter(south == "Yes"), 
+          color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_discrete_sequential(palette = "Plasma", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  #geom_sf_label_repel(data = counties_sf2 %>% 
+                        #filter(county_fips %in% c("6073", "6025", "4027", "48141", "48061", "48479")), 
+                      #aes(label = recip_county), fill='dark green', colour="white", segment.color = "black",
+                      #nudge_x = 20000, nudge_y = -250000, seed = 5, vjust = 1) +
+  theme_void()
+p.us.1
+
+ggsave("Plots/vacc.us.zoom.png", dpi = 300, height = 8, width = 10)
+
+
+```
+```{r Table - Vaccination Border comparison US, echo=FALSE}
+#For word
+
+df.table.vacc <- df.table.border2.sir.all[1:2, 1:2]
+df.sum.sir.vacc.us$series_complete_yes <- df.sum.sir.vacc.us$series_complete_yes %>% as.numeric()
+df.ssvu.border <- df.sum.sir.vacc.us %>% filter(recip_state %in% c("CA", "AZ", "NM", "TX")) %>% filter(border == "Yes")
+df.ssvu.nb <- df.sum.sir.vacc.us %>% filter(recip_state %in% c("CA", "AZ", "NM", "TX")) %>% filter(border == "No")
+
+df.table.vacc[1,3] <- sum(df.ssvu.nb$population)
+df.table.vacc[2,3] <- sum(df.ssvu.border$population)
+
+df.table.vacc[1,4] <- sum(df.ssvu.nb$series_complete_yes)
+df.table.vacc[2,4] <- sum(df.ssvu.border$series_complete_yes)
+
+df.table.vacc[1,5] <- sum(df.ssvu.nb$series_complete_yes)/sum(df.ssvu.nb$population)*100
+df.table.vacc[2,5] <- sum(df.ssvu.border$series_complete_yes)/sum(df.ssvu.border$population)*100
+
+colnames(df.table.vacc)[3:5] <- c("population", "total vaccinated", "percent")
+
+w.border <- df.ssvu.border$series_complete_pop_pct
+w.nb <- df.ssvu.nb$series_complete_pop_pct
+#wilcox.border <- wilcox.test(w.border, w.nb)
+t.border <- t.test(w.border, w.nb)
+
+```
+```{r Plot - Trends of Cases, Deaths, and Vaccination}
+#df.cdc.vacc <- jsonlite::fromJSON("https://data.cdc.gov/resource/8xkx-amqh.json?$limit=999999")
+df.cdc.vacc.long <- df.cdc.vacc %>% filter(recip_state %in% c("CA", "AZ", "NM", "TX"))
+colnames(df.cdc.vacc.long)[2] <- "county_fips"
+csf_filt2 <- counties_sf.all %>% select(county_fips, border, population)
+df.cdc.vacc.long <- df.cdc.vacc.long %>% left_join(csf_filt2, by = "county_fips")
+df.us.filt <- df.us %>% filter(state %in% c("California", "Arizona", "New Mexico", "Texas"))
+#df.us.filt <- df.us %>% filter(state %in% c("California", "Arizona", "New Mexico", "Texas") & date >= #"2020-12-13")
+df.us.filt <- df.us.filt %>% select(c(date, fips, state, cases, deaths, border, population))
+colnames(df.us.filt)[2] <- "county_fips"
+#df.us.filt$county_fips <- as.character(df.us.filt$county_fips)
+df.cdc.vacc.long$county_fips <- as.numeric(df.cdc.vacc.long$county_fips)
+df.cdc.vacc.long <- df.cdc.vacc.long %>% select(c(date, county_fips, recip_state, series_complete_pop_pct, series_complete_yes, geometry))
+df.us.filt$county_fips <- as.numeric(df.us.filt$county_fips)
+df.cdc.vacc.long$date <- as.Date(df.cdc.vacc.long$date)
+df.cvl.jhu <- df.us.filt %>% left_join(df.cdc.vacc.long, by = c("date", "county_fips"))
+
+df.cvl.jhu <- df.cvl.jhu %>% drop_na(population)
+
+df.cvl.jhu.AZ <- df.cvl.jhu %>% filter(state == "Arizona")
+df.cvl.jhu.CA <- df.cvl.jhu %>% filter(state == "California")
+df.cvl.jhu.NM <- df.cvl.jhu %>% filter(state == "New Mexico")
+df.cvl.jhu.TX <- df.cvl.jhu %>% filter(state == "Texas")
+
+case_death_vacc <- function(df.cvl.jhu) {
+df.cvl.jhu <- df.cvl.jhu %>% group_by(date, border) %>%
+  mutate(tot_complete = sum(as.numeric(series_complete_yes)))
+
+df.cvl.jhu <- df.cvl.jhu %>% group_by(date, border) %>%
+  mutate(tot_pop = sum(as.numeric(population)))
+
+df.cvl.jhu <- df.cvl.jhu %>% group_by(county_fips) %>% arrange(date) %>%
+  mutate(daily.cases = cases - lag(cases, k = 1, default = last(cases)))
+
+df.cvl.jhu <- df.cvl.jhu %>% group_by(county_fips) %>% arrange(date) %>%
+  mutate(daily.deaths = deaths - lag(deaths, k = 1, default = last(deaths)))
+
+df.cvl.jhu$daily.cases <- as.numeric(df.cvl.jhu$daily.cases)
+df.cvl.jhu$daily.deaths <- as.numeric(df.cvl.jhu$daily.deaths)
+
+df.cvl.jhu <- df.cvl.jhu %>% group_by(date, border) %>%
+  mutate(tot_cases = sum(daily.cases))
+
+df.cvl.jhu <- df.cvl.jhu %>% group_by(date, border) %>%
+  mutate(tot_deaths = sum(daily.deaths))
+
+df.cvl.jhu.sh <- df.cvl.jhu %>% select(c(date, border,
+                              tot_complete, tot_pop, tot_cases, tot_deaths))
+
+df.cvl.jhu.sh <- df.cvl.jhu.sh %>% distinct(date, .keep_all = TRUE)
+
+df.cvl.jhu.sh <- df.cvl.jhu.sh[complete.cases(df.cvl.jhu.sh$tot_pop), ]
+
+df.cvl.jhu.sh$tot_per <- round(as.numeric(df.cvl.jhu.sh$tot_complete)
+                               /as.numeric(df.cvl.jhu.sh$tot_pop)*100, digits = 1)
+
+#Daily rate
+df.cvl.jhu.sh <- df.cvl.jhu.sh %>% mutate(rate.cases.daily = tot_cases/tot_pop * 100000)
+df.cvl.jhu.sh <- df.cvl.jhu.sh %>% mutate(rate.deaths.daily = tot_deaths/tot_pop * 100000)
+
+#7-day average rate
+df.cvl.jhu.sh <- df.cvl.jhu.sh %>% group_by(border) %>% arrange(date) %>% 
+  mutate(rate.cases.avg = rollmean(rate.cases.daily, 7, fill = 0, align = "left"))
+df.cvl.jhu.sh <- df.cvl.jhu.sh %>% group_by(border) %>% arrange(date) %>%
+  mutate(rate.deaths.avg = rollmean(rate.deaths.daily, 7, fill = 0, align = "left"))
+
+df.cvl.jhu.sh <- df.cvl.jhu.sh %>% filter(date >= "2020-01-23")
+
+return(df.cvl.jhu.sh)
+}
+
+overall_cvl <- case_death_vacc(df.cvl.jhu)
+AZ_cvl <- case_death_vacc(df.cvl.jhu.AZ)
+CA_cvl <- case_death_vacc(df.cvl.jhu.CA)
+NM_cvl <- case_death_vacc(df.cvl.jhu.NM)
+TX_cvl <- case_death_vacc(df.cvl.jhu.TX)
+
+vacc <- ggplot(data = overall_cvl) +
+  geom_point(data = overall_cvl, aes(x = date, y = tot_per, color = border)) +
+  ylab("Complete \n Vaccination Percent") +
+  theme(legend.position = "none")
+
+deaths_plot <- ggplot(data = overall_cvl) +
+  geom_line(data = overall_cvl, aes(x = date, y = rate.deaths.avg, color = border)) +
+  ylab("Average Weekly \n Death Rate") +
+  theme(legend.position = "none")
+
+cases_plot <- ggplot(data = overall_cvl) +
+  geom_line(data = overall_cvl, aes(x = date, y = rate.cases.avg, color = border)) +
+  ylab("Average Weekly \n Case Rate") +
+  theme(legend.position = "none")
+
+require(gridExtra)
+grid.arrange(cases_plot, deaths_plot, vacc, ncol=1)
+
+
+cases_plot_AZ <- ggplot(data = AZ_cvl) +
+  geom_line(data = AZ_cvl, aes(x = date, y = rate.cases.avg, color = border)) +
+  ylab("Average Weekly \n Case Rate") +
+  theme(legend.position = "right")
+
+cases_plot_CA <- ggplot(data = CA_cvl) +
+  geom_line(data = CA_cvl, aes(x = date, y = rate.cases.avg, color = border)) +
+  ylab("Average Weekly \n Case Rate") +
+  theme(legend.position = "right")
+
+cases_plot_NM <- ggplot(data = NM_cvl) +
+  geom_line(data = NM_cvl, aes(x = date, y = rate.cases.avg, color = border)) +
+  ylab("Average Weekly \n Case Rate") +
+  theme(legend.position = "right")
+
+cases_plot_TX <- ggplot(data = TX_cvl) +
+  geom_line(data = TX_cvl, aes(x = date, y = rate.cases.avg, color = border)) +
+  ylab("Average Weekly \n Case Rate") +
+  theme(legend.position = "right")
+
+grid.arrange(cases_plot_AZ, cases_plot_CA, cases_plot_NM, cases_plot_TX, ncol=1)
+
+deaths_plot_AZ <- ggplot(data = AZ_cvl) +
+  geom_line(data = AZ_cvl, aes(x = date, y = rate.deaths.avg, color = border)) +
+  ylab("Average Weekly \n Death Rate AZ") +
+  theme(legend.position = "right")
+
+deaths_plot_CA <- ggplot(data = CA_cvl) +
+  geom_line(data = CA_cvl, aes(x = date, y = rate.deaths.avg, color = border)) +
+  ylab("Average Weekly \n Death Rate CA") +
+  theme(legend.position = "right")
+
+deaths_plot_NM <- ggplot(data = NM_cvl) +
+  geom_line(data = NM_cvl, aes(x = date, y = rate.deaths.avg, color = border)) +
+  ylab("Average Weekly \n Death Rate NM") +
+  theme(legend.position = "right")
+
+deaths_plot_TX <- ggplot(data = TX_cvl) +
+  geom_line(data = TX_cvl, aes(x = date, y = rate.deaths.avg, color = border)) +
+  ylab("Average Weekly \n Death Rate TX") +
+  theme(legend.position = "right")
+
+grid.arrange(deaths_plot_AZ, deaths_plot_CA, deaths_plot_NM, deaths_plot_TX, ncol=1)
+
+vacc_plot_AZ <- ggplot(data = AZ_cvl) +
+  geom_line(data = AZ_cvl, aes(x = date, y = tot_per, color = border)) +
+  ylab("Average Weekly \n Death Rate") +
+  theme(legend.position = "right")
+
+vacc_plot_CA <- ggplot(data = CA_cvl) +
+  geom_line(data = CA_cvl, aes(x = date, y = tot_per, color = border)) +
+  ylab("Average Weekly \n Death Rate") +
+  theme(legend.position = "right")
+
+vacc_plot_NM <- ggplot(data = NM_cvl) +
+  geom_line(data = NM_cvl, aes(x = date, y = tot_per, color = border)) +
+  ylab("Average Weekly \n Death Rate") +
+  theme(legend.position = "right")
+
+vacc_plot_TX <- ggplot(data = TX_cvl) +
+  geom_line(data = TX_cvl, aes(x = date, y = tot_per, color = border)) +
+  ylab("Average Weekly \n Death Rate") +
+  theme(legend.position = "right")
+
+grid.arrange(vacc_plot_AZ, vacc_plot_CA, vacc_plot_NM, vacc_plot_TX, ncol=1)
+
+
+```
+
+```{r Plot - Mexico Map vaccination rates}
+pop <- 100000
+indicator.1 <- "ratio"
+lab <- "Vaccinations per person" #"percentage of county population that has received both doses"
+
+p.mx.vacc <- ggplot(data = df.mx.vacc.map) +
+  geom_sf(mapping = aes(fill = get(indicator.1)), color = "light grey", size = 0.1) +
+  geom_sf(data = map.mx.state.1, color = "black", fill = "transparent", size = 0.2) +
+  #geom_sf(data = states_sf %>% filter(south == "Yes"), 
+          #color = "black", fill = "transparent", size = 0.2) +
+  geom_sf(data = US.mex.border, colour = "blue", size = 1) +
+  scale_fill_continuous_sequential(palette = "Plasma", rev = F, na.value = "white") +
+  labs(fill = paste(lab)) +
+  coord_sf(datum = NA) +
+  #geom_sf_label_repel(data = counties_sf2 %>% 
+                        #filter(county_fips %in% c("6073", "6025", "4027", "48141", "48061", "48479")), 
+                      #aes(label = recip_county), fill='dark green', colour="white", segment.color = "black",
+                      #nudge_x = 20000, nudge_y = -250000, seed = 5, vjust = 1) +
+  theme_void()
+p.mx.vacc
+
+ggsave("Plots/vacc.mx.png", dpi = 300, height = 8, width = 10)
+
+
+```
+```{r Table - Vaccination Border comparison Mexico, echo=FALSE}
+#For word
+
+df.table.vacc.mx <- df.table.border2.sir.all[3:4, 1:2]
+
+# df.mx.state.border <- df.mx.state.border %>% mutate(state = case_when(
+#   state == "Ciudad de México" ~ "CDMX",
+#   state == "México" ~ "Estado de México",
+#   TRUE ~ state))
+
+df.mx.vacc.current <- df.mx.vacc.current %>% mutate(border = case_when(
+  state == "Coahuila" ~ "Yes",
+  state == "Sonora" ~ "Yes",
+  state == "Chihuahua" ~ "Yes",
+  state == "Tamaulipas" ~ "Yes",
+  state == "Baja California" ~ "Yes",
+  TRUE ~ "No"
+))
+
+df.mx.vacc.current$vaccinations <- df.mx.vacc.current$ratio*df.mx.vacc.current$total
+
+df.table.vacc.mx[1,3] <- df.mx.vacc.current %>% filter(border == "No") %>% select(total) %>% sum()
+df.table.vacc.mx[2,3] <- df.mx.vacc.current %>% filter(border == "Yes") %>% select(total) %>% sum()
+
+df.table.vacc.mx[1,4] <- df.mx.vacc.current %>% filter(border == "No") %>% select(vaccinations) %>% sum()
+df.table.vacc.mx[2,4] <- df.mx.vacc.current %>% filter(border == "Yes") %>% select(vaccinations) %>% sum()
+
+df.table.vacc.mx[1,5] <- as.numeric(df.table.vacc.mx[1,4]/df.table.vacc.mx[1,3])
+df.table.vacc.mx[2,5] <- as.numeric(df.table.vacc.mx[2,4]/df.table.vacc.mx[2,3])
+
+colnames(df.table.vacc.mx)[3:5] <- c("population", "total vaccinated", "vaccinations per person")
+
+w.border.mx <- df.mx.vacc.current %>% filter(border == "Yes") %>% select(ratio)
+w.nb.mx <- df.mx.vacc.current %>% filter(border == "No") %>% select(ratio)
+#wilcox.border <- wilcox.test(w.border, w.nb)
+t.border.mx <- t.test(w.border.mx, w.nb.mx)
+```
+ 
+```{r Session Info}
+p_load(sessioninfo)
+session_info()
+session_info(to_file = "session.log")
+```
+```
